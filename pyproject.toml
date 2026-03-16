@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyserval"
+version = "0.1.0"
+description = "TPX3 camera acquisition GUI and pipeline using the SERVAL server"
+requires-python = ">=3.9"
+
+dependencies = [
+    # Core data processing
+    "numpy",
+
+    # Inter-process communication (ZMQ)
+    "pyzmq",
+
+    # SERVAL HTTP REST client
+    "requests",
+
+    # Qt abstraction layer (requires a backend: PyQt5, PyQt6, or PySide6)
+    "qtpy",
+
+    # Fast plotting widgets
+    "pyqtgraph>=0.12",
+
+    # PyMoDAQ GUI components (ParameterManager, ActionManager)
+    # Install locally from ./PyMoDAQ/packages/:
+    #   pip install -e PyMoDAQ/packages/pymodaq_utils
+    #   pip install -e PyMoDAQ/packages/pymodaq_data
+    #   pip install -e PyMoDAQ/packages/pymodaq_gui
+    "pymodaq_utils",
+    "pymodaq_gui",
+]
+
+[project.optional-dependencies]
+# JIT-compiled packet processing (strongly recommended — ~10x faster extraction)
+jit = [
+    "numba",
+]
+
+# GPU-accelerated 2D histogram accumulation (requires CUDA)
+gpu = [
+    "cupy-cuda12x",
+]
+
+# Qt backends — install exactly one
+pyqt5   = ["PyQt5"]
+pyqt6   = ["PyQt6"]
+pyside6 = ["PySide6"]
+
+# Everything for a full local install (GPU excluded)
+full = [
+    "pyserval[jit,pyqt5]",
+]
+
+dev = [
+    "pyserval[full]",
+    "pytest",
+    "pytest-qt",
+]
+
+[project.scripts]
+serval-gui = "SERVAL.gui.acquisition_gui:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["SERVAL"]

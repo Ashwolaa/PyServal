@@ -1,13 +1,83 @@
 #!/usr/bin/env python3
 """
-Data containers for TPX3 pipeline.
+Data containers and enumerations for the TPX3 pipeline.
 
-These dataclasses hold extracted pixel and trigger data with
-helper methods for concatenation and basic operations.
+Dataclasses hold extracted pixel and trigger data.
+Enumerations bridge equipment-level integer codes and human-readable labels,
+used consistently across the pipeline, workers, and GUI.
 """
 
 from dataclasses import dataclass
+from enum import IntEnum
 import numpy as np
+
+
+# =============================================================================
+# Enumerations
+# =============================================================================
+
+class TDCChannel(IntEnum):
+    """TDC channel selector.
+
+    The integer value is the equipment code used in the data stream and all
+    pipeline configuration dicts (``extract_config["tdc_id"]``).
+
+    ``BOTH`` (0) accepts triggers from either channel.
+    """
+    BOTH = 0
+    TDC1 = 1
+    TDC2 = 2
+
+    @property
+    def label(self) -> str:
+        """Human-readable label used in the GUI."""
+        return {
+            TDCChannel.BOTH: "Both",
+            TDCChannel.TDC1: "TDC1",
+            TDCChannel.TDC2: "TDC2",
+        }[self]
+
+    @classmethod
+    def from_label(cls, label: str) -> "TDCChannel":
+        """Return the TDCChannel matching a GUI label string."""
+        mapping = {ch.label: ch for ch in cls}
+        if label not in mapping:
+            raise ValueError(f"Unknown TDC label {label!r}. Valid: {list(mapping)}")
+        return mapping[label]
+
+    @classmethod
+    def labels(cls) -> list:
+        """Ordered list of labels for populating GUI drop-downs."""
+        return [ch.label for ch in cls]
+
+
+class TriggerEdge(IntEnum):
+    """Trigger edge selector.
+
+    The integer value matches the ``edge`` field in ``TRIGGER_DTYPE`` and the
+    classification produced by ``extract_triggers()``:
+    ``0`` = rising, ``1`` = falling.
+    """
+    RISING  = 0
+    FALLING = 1
+
+    @property
+    def label(self) -> str:
+        """Human-readable label used in the GUI."""
+        return self.name.capitalize()   # "Rising" / "Falling"
+
+    @classmethod
+    def from_label(cls, label: str) -> "TriggerEdge":
+        """Return the TriggerEdge matching a GUI label string."""
+        mapping = {e.label: e for e in cls}
+        if label not in mapping:
+            raise ValueError(f"Unknown edge label {label!r}. Valid: {list(mapping)}")
+        return mapping[label]
+
+    @classmethod
+    def labels(cls) -> list:
+        """Ordered list of labels for populating GUI drop-downs."""
+        return [e.label for e in cls]
 
 
 @dataclass

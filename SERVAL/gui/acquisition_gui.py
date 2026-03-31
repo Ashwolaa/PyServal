@@ -12,6 +12,7 @@ Usage:
 """
 
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from pymodaq_gui.managers.action_manager import ActionManager
 from pymodaq_gui.managers.parameter_manager import ParameterManager
 
 from SERVAL.controllers.serval_control import SERVALController
+from SERVAL.core.data_types import TDCChannel, TriggerEdge
 from SERVAL.gui.histogram_controller import HistogramController
 from SERVAL.gui.pipeline_thread import PipelineThread
 
@@ -130,7 +132,7 @@ class ImageDockWidget(QDockWidget):
 
         # Time series plot (visible by default)
         self.timeseries_plot = pg.PlotWidget()
-        self.timeseries_plot.setLabel('left', 'Counts')
+        self.timeseries_plot.setLabel('left', 'Counts/Shot')
         self.timeseries_plot.setLabel('bottom', 'Time', units='s')
         self.timeseries_plot.showGrid(x=True, y=True, alpha=0.3)
         pen_color = color[:3] if color else (100, 100, 255)
@@ -215,7 +217,9 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             {'title': 'Fast Extract', 'name': 'use_fast_extract', 'type': 'bool',
              'value': True},
             {'title': 'TDC', 'name': 'tdc_id', 'type': 'list',
-             'limits': ['TDC1', 'TDC2', 'Both'], 'value': 'TDC1'},
+             'limits': TDCChannel.labels(), 'value': TDCChannel.TDC1.label},
+            {'title': 'Edge', 'name': 'edge', 'type': 'list',
+             'limits': TriggerEdge.labels(), 'value': TriggerEdge.RISING.label},
             {'title': 'Event Window Min (ns)', 'name': 'event_window_min', 'type': 'float',
              'value': 0.0},
             {'title': 'Event Window Max (ns)', 'name': 'event_window_max', 'type': 'float',
@@ -228,6 +232,15 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             {'title': 'Save Pixels', 'name': 'save_pixels', 'type': 'bool', 'value': False},
             {'title': 'Callback Mode', 'name': 'callback_mode', 'type': 'list',
              'limits': ['events', 'pixels', 'disabled'], 'value': 'events'},
+            {'title': 'Centroiding', 'name': 'centroiding', 'type': 'group', 'children': [
+                {'title': 'Enable', 'name': 'use_centroiding', 'type': 'bool', 'value': False},
+                {'title': 'Spatial eps (px)', 'name': 'eps_space', 'type': 'int',
+                 'value': 2, 'limits': (1, 10)},
+                {'title': 'Time eps (ns)', 'name': 'eps_time_ns', 'type': 'float',
+                 'value': 100.0, 'limits': (1.0, 10000.0), 'step': 1.0, 'decimals': 0},
+                {'title': 'Buffer depth', 'name': 'b_size', 'type': 'int',
+                 'value': 16, 'limits': (4, 128)},
+            ]},
         ]},
         {'title': 'Display', 'name': 'display', 'type': 'group', 'children': [
             {'title': 'Refresh Rate (s)', 'name': 'refresh_rate_s', 'type': 'float',
@@ -269,8 +282,9 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         # Timers
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self._update_histograms)
-        self.clear_timer = QTimer()
-        self.clear_timer.timeout.connect(self._on_clear_histograms)
+
+        # Auto-clear: tracked via timestamp, triggered inside _update_histograms
+        self._last_clear_time = None
 
         # Setup UI
         self._setup_ui()
@@ -292,11 +306,10 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             if self.is_acquiring:
                 self.refresh_timer.start(int(param.value() * 1000))
         elif name == 'clear_interval':
-            if self.is_acquiring:
-                if param.value() > 0:
-                    self.clear_timer.start(int(param.value() * 1000))
-                else:
-                    self.clear_timer.stop()
+            # Handled inside _update_histograms; reset the timer so the new
+            # interval starts from the current moment.
+            if self.is_acquiring and param.value() > 0:
+                self._last_clear_time = time.time()
         elif name == 'colormap':
             self._on_colormap_changed(param.value())
         elif name in ('tof_bins', 'tof_max_ns'):
@@ -599,12 +612,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     # =========================================================================
     # Display Handlers
     # =========================================================================
-    def _on_clear_histograms(self):
-        """Clear histograms only (called by timer)."""
-        self.histogram.clear()
-        self._update_histograms()
-        self.status_bar.showMessage("Histograms cleared")
-
     def _on_clear_all(self):
         """Clear histograms and time series (called by button)."""
         self.histogram.clear()
@@ -826,15 +833,20 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
 
     def _build_extract_config(self):
         p = self.settings.child('pipeline')
-        tdc_map = {'TDC1': 1, 'TDC2': 2, 'Both': 0}
+        c = p.child('centroiding')
         return {
             'num_workers': p['num_workers'],
             'use_fast_extract': p['use_fast_extract'],
-            'tdc_id': tdc_map.get(p['tdc_id'], 1),
+            'tdc_id': TDCChannel.from_label(p['tdc_id']),
+            'edge': TriggerEdge.from_label(p['edge']),
             'event_window': (
                 p['event_window_min'],
                 p['event_window_max'],
             ),
+            'use_centroiding': c['use_centroiding'],
+            'eps_space': c['eps_space'],
+            'eps_time_ns': c['eps_time_ns'],
+            'b_size': c['b_size'],
         }
 
     def _build_save_config(self):
@@ -915,13 +927,11 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.stop_btn.setEnabled(True)
         self.record_btn.setEnabled(True)
 
+        self._last_clear_time = time.time()
+
         refresh_rate_s = self.settings.child('display', 'refresh_rate_s').value()
         if refresh_rate_s > 0:
             self.refresh_timer.start(int(refresh_rate_s * 1000))
-
-        clear_interval = self.settings.child('display', 'clear_interval').value()
-        if clear_interval > 0:
-            self.clear_timer.start(int(clear_interval * 1000))
 
         self.status_bar.showMessage("Acquisition running")
 
@@ -999,7 +1009,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.get_action('record').setEnabled(False)
         self._set_pipeline_controls_enabled(True)
         self.refresh_timer.stop()
-        self.clear_timer.stop()
+        self._last_clear_time = None
         self.status_bar.showMessage("Acquisition stopped")
         self._update_histograms()
 
@@ -1010,10 +1020,13 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     def _set_pipeline_controls_enabled(self, enabled):
         """Enable/disable pipeline and SERVAL destination parameters during acquisition."""
         p = self.settings.child('pipeline')
-        for name in ['num_workers', 'use_fast_extract', 'tdc_id', 'event_window_min',
+        for name in ['num_workers', 'use_fast_extract', 'tdc_id', 'edge', 'event_window_min',
                      'event_window_max', 'output_dir', 'run_name', 'save_raw',
                      'save_events', 'save_pixels', 'callback_mode']:
             p.child(name).setOpts(enabled=enabled)
+        c = p.child('centroiding')
+        for name in ['use_centroiding', 'eps_space', 'eps_time_ns', 'b_size']:
+            c.child(name).setOpts(enabled=enabled)
         s = self.settings.child('serval')
         for name in ['dest_host', 'dest_port']:
             s.child(name).setOpts(enabled=enabled)
@@ -1067,6 +1080,16 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         stats = self.histogram.get_stats()
         self.stats_label.setText(f"Events: {stats['total_events']:,} | Total: {stats['pixel_sum']:,}")
 
+        # Auto-clear: check interval AFTER displaying so we never show a 0-count frame.
+        # The 2D histogram accumulates normally; only the per-refresh rate drives the
+        # timeseries, so clearing here does not affect counts/shot accuracy.
+        if self.is_acquiring and self._last_clear_time is not None:
+            clear_interval = self.settings.child('display', 'clear_interval').value()
+            if clear_interval > 0 and (time.time() - self._last_clear_time) >= clear_interval:
+                self.histogram.clear()
+                self._last_clear_time = time.time()
+                self.status_bar.showMessage("Histograms cleared")
+
     # =========================================================================
     # Window Events
     # =========================================================================
@@ -1090,6 +1113,13 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
 
 
 def main():
+    # Must be set before any threads (Qt, ZMQ, …) are created.
+    # 'forkserver' forks workers from a clean, single-threaded helper process,
+    # avoiding the deadlock risk that arises when fork() is called from a
+    # multi-threaded parent (Python 3.12+ DeprecationWarning).
+    import multiprocessing
+    multiprocessing.set_start_method('forkserver', force=False)
+
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     window = ServalAcquisitionGUI()

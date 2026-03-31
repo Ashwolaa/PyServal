@@ -58,13 +58,20 @@ class HistogramController:
         self._total_events = 0
         self._total_pixels = 0
 
+        # Trigger counting for counts/shot normalization
+        self._last_trigger_num = 0
+
         # Time series tracking
         self._max_timeseries_points = max_timeseries_points
         self._timeseries_start = None
-        self._total_timeseries = []  # List of (time, counts)
+        self._total_timeseries = []  # List of (time, counts_per_shot)
         # ROI time series stored in roi_data["timeseries"]
 
-    def add_events(self, _event_num, x, y, tof, _tot):
+        # Baselines for computing per-sample deltas
+        self._last_sampled_pixel_count = 0
+        self._last_sampled_trigger_num = 0
+
+    def add_events(self, event_num, x, y, tof, _tot):
         """
         Add event data to histograms.
 
@@ -121,6 +128,10 @@ class HistogramController:
                     )
                     roi_data["hist"] += roi_hist.astype(np.int64)
 
+
+            # Update trigger counter (event_num is the laser-shot / trigger index)
+            if len(event_num) > 0:
+                self._last_trigger_num = max(self._last_trigger_num, int(event_num.max()))
 
             # Update stats
             self._total_events += len(x)
@@ -204,9 +215,11 @@ class HistogramController:
 
     def sample_timeseries(self):
         """
-        Record a time series sample of current counts.
+        Record a time series sample of counts per laser shot.
 
-        Should be called periodically (e.g., every refresh) to build up time series data.
+        Computes the incremental counts since the last sample divided by the
+        incremental number of trigger events (laser shots) to yield counts/shot.
+        Should be called periodically (e.g., every refresh).
         """
         with self._lock:
             now = time.time()
@@ -214,19 +227,35 @@ class HistogramController:
                 self._timeseries_start = now
 
             elapsed = now - self._timeseries_start
-            total_counts = int(self._pixel_hist.sum())
+            current_pixel_count = int(self._pixel_hist.sum())
+            current_trigger_num = self._last_trigger_num
 
-            # Add total counts sample
-            self._total_timeseries.append((elapsed, total_counts))
+            delta_counts = current_pixel_count - self._last_sampled_pixel_count
+            delta_triggers = current_trigger_num - self._last_sampled_trigger_num
+            rate = delta_counts / delta_triggers if delta_triggers > 0 else 0.0
+
+            self._last_sampled_pixel_count = current_pixel_count
+            self._last_sampled_trigger_num = current_trigger_num
+
+            self._total_timeseries.append((elapsed, rate))
             if len(self._total_timeseries) > self._max_timeseries_points:
                 self._total_timeseries.pop(0)
 
-            # Add ROI counts samples
+            # Add ROI counts/shot samples
             for roi_data in self._rois.values():
                 roi_counts = int(roi_data["hist"].sum())
+                last_roi_count = roi_data.get("last_sampled_count", 0)
+                last_roi_trigger = roi_data.get("last_sampled_trigger", 0)
+
+                delta_roi = roi_counts - last_roi_count
+                roi_rate = delta_roi / delta_triggers if delta_triggers > 0 else 0.0
+
+                roi_data["last_sampled_count"] = roi_counts
+                roi_data["last_sampled_trigger"] = current_trigger_num
+
                 if "timeseries" not in roi_data:
                     roi_data["timeseries"] = []
-                roi_data["timeseries"].append((elapsed, roi_counts))
+                roi_data["timeseries"].append((elapsed, roi_rate))
                 if len(roi_data["timeseries"]) > self._max_timeseries_points:
                     roi_data["timeseries"].pop(0)
 
@@ -271,7 +300,7 @@ class HistogramController:
                     roi_data["timeseries"].clear()
 
     def clear(self):
-        """Clear all histogram data (keeps ROI definitions)."""
+        """Clear all histogram data (keeps ROI definitions and timeseries)."""
         with self._lock:
             self._pixel_hist.fill(0)
             self._tof_counts.fill(0)
@@ -281,9 +310,13 @@ class HistogramController:
             self._y_buffer.clear()
             self._tof_buffer.clear()
 
+            # Reset per-sample baselines so next timeseries point measures from zero
+            self._last_sampled_pixel_count = 0
+
             # Clear ROI histograms but keep definitions
             for roi_data in self._rois.values():
                 roi_data["hist"].fill(0)
+                roi_data["last_sampled_count"] = 0
 
     def set_tof_config(self, tof_range=None, tof_bins=None):
         """

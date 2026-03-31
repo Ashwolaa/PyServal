@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Optional, Union, Any
 import numpy as np
 
-# Event data dtype (must match ExtractorWorker.EVENT_DTYPE)
+# Event data dtype (must match ExtractorWorker output)
 EVENT_DTYPE = np.dtype([
-    ("event_num", "<u8"),
+    ("t_trigger", "<f8"),  # absolute trigger time (seconds)
     ("x", "<u2"),
     ("y", "<u2"),
     ("tof", "<f8"),
@@ -20,6 +20,12 @@ PIXEL_DTYPE = np.dtype([
     ("y", "<u2"),
     ("toa", "<f8"),
     ("tot", "<u4"),
+])
+# Trigger data dtype
+TRIGGER_DTYPE = np.dtype([
+    ("toa", "<f8"),      # absolute time in seconds
+    ("tdc_id", "<u1"),   # 1 or 2
+    ("edge", "<u1"),     # 0 = rising, 1 = falling
 ])
 
 class BaseSaverProcess(multiprocessing.Process, ABC):
@@ -166,8 +172,8 @@ class EventSaverProcess(BaseSaverProcess):
             buffer[:buffer_pos].tofile(f)
 
     def _process_data_message(self, msg):
-        event_num, x, y, tof, tot = msg
-        n_events = len(event_num)
+        t_trigger, x, y, tof, tot = msg
+        n_events = len(t_trigger)
         self._total_items += n_events
 
         if self._buffer_pos + n_events > self.buffer_size:
@@ -177,7 +183,7 @@ class EventSaverProcess(BaseSaverProcess):
             self._buffer_pos = 0
         if n_events > self.buffer_size:
             records = np.empty(n_events, dtype=EVENT_DTYPE)
-            records["event_num"] = event_num
+            records["t_trigger"] = t_trigger
             records["x"] = x
             records["y"] = y
             records["tof"] = tof
@@ -186,7 +192,7 @@ class EventSaverProcess(BaseSaverProcess):
             self._flush_count += 1
         else:
             end = self._buffer_pos + n_events
-            self._buffer["event_num"][self._buffer_pos:end] = event_num
+            self._buffer["t_trigger"][self._buffer_pos:end] = t_trigger
             self._buffer["x"][self._buffer_pos:end] = x
             self._buffer["y"][self._buffer_pos:end] = y
             self._buffer["tof"][self._buffer_pos:end] = tof
@@ -275,3 +281,57 @@ class PixelSaverProcess(BaseSaverProcess):
         self._buffer["toa"][self._buffer_pos:end] = toa
         self._buffer["tot"][self._buffer_pos:end] = tot
         self._buffer_pos = end
+
+
+class TriggerSaverProcess(BaseSaverProcess):
+    def __init__(
+        self,
+        input_queue: multiprocessing.Queue,
+        buffer_size: int = 500_000,
+        log_level: str = "INFO",
+        log_interval: int = 100,
+        use_np_save: bool = False,
+    ):
+        super().__init__(
+            input_queue=input_queue,
+            buffer_size=buffer_size,
+            log_level=log_level,
+            log_interval=log_interval,
+            name="TriggerSaverProcess",
+            use_np_save=use_np_save,
+        )
+        self._item_size = 10  # bytes per trigger record (f8 + u1 + u1)
+
+    def _init_buffer(self):
+        self._buffer = np.empty(self.buffer_size, dtype=TRIGGER_DTYPE)
+
+    def _write_buffer_to_file(self, f, buffer, buffer_pos):
+        if self.use_np_save:
+            np.save(f, buffer[:buffer_pos])
+        else:
+            buffer[:buffer_pos].tofile(f)
+
+    def _process_data_message(self, msg):
+        toa, tdc_id, edge = msg
+        n_triggers = len(toa)
+        self._total_items += n_triggers
+
+        if self._buffer_pos + n_triggers > self.buffer_size:
+            if self._buffer_pos > 0:
+                self._write_buffer_to_file(self._file, self._buffer, self._buffer_pos)
+                self._flush_count += 1
+            self._buffer_pos = 0
+
+        if n_triggers > self.buffer_size:
+            records = np.empty(n_triggers, dtype=TRIGGER_DTYPE)
+            records["toa"] = toa
+            records["tdc_id"] = tdc_id
+            records["edge"] = edge
+            records.tofile(self._file)
+            self._flush_count += 1
+        else:
+            end = self._buffer_pos + n_triggers
+            self._buffer["toa"][self._buffer_pos:end] = toa
+            self._buffer["tdc_id"][self._buffer_pos:end] = tdc_id
+            self._buffer["edge"][self._buffer_pos:end] = edge
+            self._buffer_pos = end

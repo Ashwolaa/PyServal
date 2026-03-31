@@ -30,6 +30,7 @@ from SERVAL.core.extractors.jit_functions import (
     extract_triggers,
     correlate_pixels as _correlate_pixels_jit,
     correlate_pixels_parallel as _correlate_pixels_parallel,
+    centroid_hits as _centroid_hits,
 )
 
 # Re-export for backwards compatibility
@@ -42,6 +43,7 @@ __all__ = [
     'merge_pixels',
     '_correlate_pixels_jit',
     '_correlate_pixels_parallel',
+    '_centroid_hits',
 ]
 
 

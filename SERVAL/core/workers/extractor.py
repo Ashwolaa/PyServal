@@ -15,8 +15,12 @@ import numpy as np
 import zmq
 
 from SERVAL.utils.logging import get_logger
-from SERVAL.core.extractors.parallel_processor import TPX3Extractor, _correlate_pixels_jit, _correlate_pixels_parallel
-from .savers import EventSaverProcess, PixelSaverProcess
+from SERVAL.core.data_types import TDCChannel, TriggerEdge
+from SERVAL.core.extractors.parallel_processor import (
+    TPX3Extractor, PixelData,
+    _correlate_pixels_jit, _correlate_pixels_parallel, _centroid_hits,
+)
+from .savers import EventSaverProcess, PixelSaverProcess, TriggerSaverProcess
 
 
 class ExtractorWorker(multiprocessing.Process):
@@ -37,14 +41,21 @@ class ExtractorWorker(multiprocessing.Process):
         stats_interval: int = 100,  # Log stats every N chunks
         use_fast_extract: bool = False,
         log_level: str = "INFO",
-        tdc_id: int = 1,  # Filter triggers: 1=TDC1, 2=TDC2, 0=both
+        tdc_id: TDCChannel = TDCChannel.TDC1,
+        edge: TriggerEdge = TriggerEdge.RISING,
         event_window: tuple = (0.0, 100_000_000.0),  # ns
         write_buffer_size: int = 500_000,
         correlate_func = _correlate_pixels_parallel,
+        use_centroiding: bool = False,
+        eps_space: int = 2,       # pixels (Manhattan distance)
+        eps_time_ns: float = 100.0,  # nanoseconds
+        b_size: int = 16,
         event_queue: Optional[multiprocessing.Queue] = None,  # For correlated events (saving)
         pixel_queue: Optional[multiprocessing.Queue] = None,  # For raw pixels (saving)
+        trigger_queue: Optional[multiprocessing.Queue] = None,  # For all triggers (saving)
         callback_event_queue: Optional[multiprocessing.Queue] = None,  # For GUI callbacks
         callback_pixel_queue: Optional[multiprocessing.Queue] = None,  # For GUI callbacks
+        callback_trigger_queue: Optional[multiprocessing.Queue] = None,  # For GUI callbacks
         recording_flag=None,  # multiprocessing.Value('b', 0) — gates saver queue puts
     ):
         super().__init__(name=f"Extractor-{worker_id}")
@@ -52,16 +63,23 @@ class ExtractorWorker(multiprocessing.Process):
         self.zmq_port = zmq_port
         self.event_queue = event_queue
         self.pixel_queue = pixel_queue
+        self.trigger_queue = trigger_queue
         self.callback_event_queue = callback_event_queue
         self.callback_pixel_queue = callback_pixel_queue
+        self.callback_trigger_queue = callback_trigger_queue
         self.stats_interval = stats_interval
         self.use_fast_extract = use_fast_extract
         self.log_level = log_level
         self.tdc_id = tdc_id
+        self.edge = edge
         self.event_window_min = event_window[0] * 1e-9
         self.event_window_max = event_window[1] * 1e-9
         self.write_buffer_size = write_buffer_size
         self.recording_flag = recording_flag
+        self.use_centroiding = use_centroiding
+        self.eps_space = eps_space
+        self.eps_time = eps_time_ns * 1e-9  # convert to seconds
+        self.b_size = b_size
         self.daemon = True
         self._correlate_func = correlate_func
     
@@ -97,7 +115,6 @@ class ExtractorWorker(multiprocessing.Process):
         total_triggers = 0
         total_events = 0
         start_time = time.time()
-        event_offset = 0
         
         diagnostics = {'t_extract': np.empty(self.stats_interval),
                         't_correlate': np.empty(self.stats_interval),
@@ -119,9 +136,30 @@ class ExtractorWorker(multiprocessing.Process):
                 pixels, triggers, _, _ = extract_fn(raw_bytes)
                 t_extract = time.perf_counter()
 
+                # Optional greedy centroiding (replaces raw pixels with centroids)
+                if self.use_centroiding and len(pixels) > 0:
+                    cx, cy, ctoa, ctot, _ = _centroid_hits(
+                        pixels.x, pixels.y, pixels.toa, pixels.tot,
+                        self.eps_space, self.eps_time, self.b_size,
+                    )
+                    pixels = PixelData(x=cx, y=cy, toa=ctoa, tot=ctot)
+
                 chunks_processed += 1
                 total_pixels += len(pixels)
                 total_triggers += len(triggers)
+
+                # Send all triggers to trigger queue (before TDC filter)
+                if len(triggers) > 0:
+                    trigger_data = (triggers.toa, triggers.tdc_id, triggers.edge)
+                    if self.trigger_queue is not None and (
+                        self.recording_flag is None or self.recording_flag.value
+                    ):
+                        self.trigger_queue.put(trigger_data)
+                    if self.callback_trigger_queue is not None:
+                        try:
+                            self.callback_trigger_queue.put_nowait(trigger_data)
+                        except Exception:
+                            pass
 
                 # Send raw pixels to queues if enabled
                 if len(pixels) > 0:
@@ -145,11 +183,11 @@ class ExtractorWorker(multiprocessing.Process):
                 if len(pixels) == 0 or len(triggers) == 0:
                     continue
 
-                # Filter triggers by TDC
+                # Filter triggers by TDC and edge
                 if self.tdc_id == 0:
-                    mask = triggers.edge == 0
+                    mask = triggers.edge == self.edge
                 else:
-                    mask = (triggers.tdc_id == self.tdc_id) & (triggers.edge == 0)
+                    mask = (triggers.tdc_id == self.tdc_id) & (triggers.edge == self.edge)
 
                 trigger_times = triggers.toa[mask]
 
@@ -162,7 +200,7 @@ class ExtractorWorker(multiprocessing.Process):
                         trigger_times = np.sort(trigger_times)
 
                 # JIT correlation
-                event_num, ex, ey, etof, etot, n_valid = self.correlate_func(
+                t_trigger, ex, ey, etof, etot, n_valid = self.correlate_func(
                     pixels.toa,
                     pixels.x,
                     pixels.y,
@@ -170,7 +208,6 @@ class ExtractorWorker(multiprocessing.Process):
                     trigger_times,
                     self.event_window_min,
                     self.event_window_max,
-                    np.uint64(event_offset),
                 )
 
                 t_corr = time.perf_counter()
@@ -179,7 +216,7 @@ class ExtractorWorker(multiprocessing.Process):
                     continue
 
                 # Send to event queues
-                event_data = (event_num, ex, ey, etof, etot)
+                event_data = (t_trigger, ex, ey, etof, etot)
                 # Saver queue (gated by recording_flag)
                 if self.event_queue is not None and (
                     self.recording_flag is None or self.recording_flag.value
@@ -192,7 +229,6 @@ class ExtractorWorker(multiprocessing.Process):
                     except Exception:
                         pass  # Drop if queue full - GUI can handle missing frames
 
-                event_offset += len(trigger_times)
                 total_events += n_valid
 
                 index = (chunks_processed-1) % self.stats_interval
@@ -242,6 +278,7 @@ class ExtractorPool:
     DEFAULT_SAVE_CONFIG = {
         "events": {"enabled": True, "num_savers": 1, "buffer_size": 500_000},
         "pixels": {"enabled": False, "num_savers": 1, "buffer_size": 500_000},
+        "triggers": {"enabled": True, "num_savers": 1, "buffer_size": 500_000},
     }
 
     def __init__(
@@ -250,7 +287,8 @@ class ExtractorPool:
         zmq_port: int,
         use_fast_extract: bool = False,
         log_level: str = "INFO",
-        tdc_id: int = 1,
+        tdc_id: TDCChannel = TDCChannel.TDC1,
+        edge: TriggerEdge = TriggerEdge.RISING,
         event_window: tuple = (0.0, 10_000.0),
         zmq_hwm: int = 1000,
         output_dir: Optional[Path] = None,
@@ -258,18 +296,27 @@ class ExtractorPool:
         callback_event_queue: Optional[multiprocessing.Queue] = None,
         callback_pixel_queue: Optional[multiprocessing.Queue] = None,
         recording_flag=None,  # multiprocessing.Value — gates saver queue puts
+        use_centroiding: bool = False,
+        eps_space: int = 2,
+        eps_time_ns: float = 100.0,
+        b_size: int = 16,
     ):
         self.num_workers = num_workers
         self.zmq_port = zmq_port
         self.use_fast_extract = use_fast_extract
         self.log_level = log_level
         self.tdc_id = tdc_id
+        self.edge = edge
         self.event_window = event_window
         self.output_dir = output_dir
         self.zmq_hwm = zmq_hwm
         self.callback_event_queue = callback_event_queue
         self.callback_pixel_queue = callback_pixel_queue
         self.recording_flag = recording_flag
+        self.use_centroiding = use_centroiding
+        self.eps_space = eps_space
+        self.eps_time_ns = eps_time_ns
+        self.b_size = b_size
 
         # Merge user config with defaults
         self.save_config = {
@@ -280,9 +327,9 @@ class ExtractorPool:
         self.zmq_context = None
         self.zmq_socket = None
         self.workers = []
-        # Saver processes/queues keyed by type ("events", "pixels")
-        self.saver_processes = {"events": [], "pixels": []}
-        self.saver_queues = {"events": [], "pixels": []}
+        # Saver processes/queues keyed by type ("events", "pixels", "triggers")
+        self.saver_processes = {"events": [], "pixels": [], "triggers": []}
+        self.saver_queues = {"events": [], "pixels": [], "triggers": []}
         self.logger = get_logger("SERVAL.ExtractorPool")
 
         # Create saver queues and processes upfront (started idle)
@@ -290,7 +337,11 @@ class ExtractorPool:
 
     def _init_savers(self):
         """Create saver queues and processes (idle, not yet started)."""
-        type_to_class = {"events": EventSaverProcess, "pixels": PixelSaverProcess}
+        type_to_class = {
+            "events": EventSaverProcess,
+            "pixels": PixelSaverProcess,
+            "triggers": TriggerSaverProcess,
+        }
         for saver_type, saver_class in type_to_class.items():
             config = self.save_config[saver_type]
             if not config["enabled"] or config.get("num_savers", 0) == 0:
@@ -340,6 +391,7 @@ class ExtractorPool:
         for i in range(self.num_workers):
             events_queues = self.saver_queues["events"]
             pixels_queues = self.saver_queues["pixels"]
+            triggers_queues = self.saver_queues["triggers"]
 
             event_queue = (
                 events_queues[i % len(events_queues)] if events_queues else None
@@ -347,19 +399,28 @@ class ExtractorPool:
             pixel_queue = (
                 pixels_queues[i % len(pixels_queues)] if pixels_queues else None
             )
+            trigger_queue = (
+                triggers_queues[i % len(triggers_queues)] if triggers_queues else None
+            )
 
             worker = ExtractorWorker(
                 worker_id=i,
                 zmq_port=self.zmq_port,
                 event_queue=event_queue,
                 pixel_queue=pixel_queue,
+                trigger_queue=trigger_queue,
                 callback_event_queue=self.callback_event_queue,
                 callback_pixel_queue=self.callback_pixel_queue,
                 use_fast_extract=self.use_fast_extract,
                 log_level=self.log_level,
                 tdc_id=self.tdc_id,
+                edge=self.edge,
                 event_window=self.event_window,
                 recording_flag=self.recording_flag,
+                use_centroiding=self.use_centroiding,
+                eps_space=self.eps_space,
+                eps_time_ns=self.eps_time_ns,
+                b_size=self.b_size,
             )
             worker.start()
             self.workers.append(worker)
@@ -402,6 +463,15 @@ class ExtractorPool:
                 if saver.is_alive():
                     saver.terminate()
             self.saver_processes[saver_type].clear()
+
+        # Release semaphores held by each Queue after all consumers have exited
+        for saver_type in self.saver_queues:
+            for q in self.saver_queues[saver_type]:
+                try:
+                    q.close()
+                    q.join_thread()
+                except Exception:
+                    pass
             self.saver_queues[saver_type].clear()
 
         self.logger.info("Shutdown complete")

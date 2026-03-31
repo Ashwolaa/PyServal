@@ -15,15 +15,17 @@ processes that start idle. Call start_record() / stop_record() to
 begin and end a recording session without restarting the pipeline.
 """
 
+import json
 import multiprocessing
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from SERVAL.utils.logging import get_logger
 from SERVAL.utils import EventBus, Events
+from SERVAL.core.data_types import TDCChannel, TriggerEdge
 from SERVAL.core.tcp_receiver import TCPReceiver
 from SERVAL.core.stats_reporter import StatsReporter
 from SERVAL.core.workers import ExtractorPool, RawSaverProcess
@@ -60,6 +62,7 @@ class TPX3PipelineV3:
         "raw": {"enabled": True, "num_savers": 1, "buffer_size": 8 * 1024 * 1024, "queue_size": 200},
         "events": {"enabled": True, "num_savers": 2, "buffer_size":500_000, "queue_size": 1000},
         "pixels": {"enabled": False, "num_savers": 0, "buffer_size": 500_000, "queue_size": 1000},
+        "triggers": {"enabled": True, "num_savers": 1, "buffer_size": 500_000, "queue_size": 1000},
     }
 
     DEFAULT_EXTRACT_CONFIG = {
@@ -69,9 +72,15 @@ class TPX3PipelineV3:
         "zmq_port": 9200,
         "zmq_hwm": 1000,
         "event_window": (0.0, 10_000.0),  # ns
-        "tdc_id": 1,  # 1=TDC1, 2=TDC2, 0=both
+        "tdc_id": TDCChannel.TDC1,
+        "edge": TriggerEdge.RISING,
         "events": True,
-        "pixels": True
+        "pixels": True,
+        # Greedy centroiding (applied to raw pixels before trigger correlation)
+        "use_centroiding": False,
+        "eps_space": 2,        # pixels, Manhattan distance
+        "eps_time_ns": 100.0,  # nanoseconds
+        "b_size": 16,          # lookback buffer depth
     }
 
     DEFAULT_CALLBACK_CONFIG = {
@@ -107,6 +116,7 @@ class TPX3PipelineV3:
             "raw": {**self.DEFAULT_SAVE_CONFIG["raw"], **user_save.get("raw", {})},
             "events": {**self.DEFAULT_SAVE_CONFIG["events"], **user_save.get("events", {})},
             "pixels": {**self.DEFAULT_SAVE_CONFIG["pixels"], **user_save.get("pixels", {})},
+            "triggers": {**self.DEFAULT_SAVE_CONFIG["triggers"], **user_save.get("triggers", {})},
         }
 
         self.output_dir = Path(self.save_config["output_dir"])
@@ -161,7 +171,7 @@ class TPX3PipelineV3:
         # ExtractorPool handles events/pixels savers
         ext = self.extract_config
         extractor_save_config = {
-            k: v for k, v in self.save_config.items() if k in ("events", "pixels")
+            k: v for k, v in self.save_config.items() if k in ("events", "pixels", "triggers")
         }
         self.extractors = ExtractorPool(
             num_workers=ext["num_workers"],
@@ -169,6 +179,7 @@ class TPX3PipelineV3:
             use_fast_extract=ext["use_fast_extract"],
             log_level=log_level,
             tdc_id=ext["tdc_id"],
+            edge=ext["edge"],
             event_window=ext["event_window"],
             zmq_hwm=ext["zmq_hwm"],
             output_dir=self.output_dir,
@@ -176,6 +187,10 @@ class TPX3PipelineV3:
             callback_event_queue=self.callback_event_queue,
             callback_pixel_queue=self.callback_pixel_queue,
             recording_flag=self._recording_flag,
+            use_centroiding=ext.get("use_centroiding", False),
+            eps_space=ext.get("eps_space", 2),
+            eps_time_ns=ext.get("eps_time_ns", 100.0),
+            b_size=ext.get("b_size", 16),
         )
 
         # Callbacks for events and pixels
@@ -219,6 +234,7 @@ class TPX3PipelineV3:
         save_raw: bool = True,
         save_events: bool = True,
         save_pixels: bool = False,
+        save_triggers: bool = True,
     ) -> bool:
         """
         Begin a recording session.
@@ -229,8 +245,8 @@ class TPX3PipelineV3:
         Parameters
         ----------
         filename : str
-            Base filename (without extension). Files will be created as
-            {output_dir}/{filename}.tpx3, {filename}_events.dat, etc.
+            Run name. A subdirectory {output_dir}/{filename}/ is created and
+            all files are placed inside it: {filename}.tpx3, {filename}_events.dat, etc.
         output_dir : str, optional
             Directory for output files. Defaults to self.output_dir.
         save_raw : bool
@@ -239,6 +255,8 @@ class TPX3PipelineV3:
             Write correlated events .dat file (requires events saver).
         save_pixels : bool
             Write raw pixel .dat file (requires pixels saver).
+        save_triggers : bool
+            Write triggers .trg file (requires triggers saver).
 
         Returns
         -------
@@ -253,56 +271,112 @@ class TPX3PipelineV3:
             self.stop_record()
 
         base_dir = Path(output_dir) if output_dir else self.output_dir
-        base_dir.mkdir(parents=True, exist_ok=True)
+        # Each recording gets its own subdirectory named after the run
+        run_dir = base_dir / filename
+        run_dir.mkdir(parents=True, exist_ok=True)
 
         active_savers = []
+        file_map = {}
 
         # Send NEW_FILE to raw savers
         if save_raw and self.raw_saver_queues:
             for i, q in enumerate(self.raw_saver_queues):
                 suffix = f"_raw{i}" if len(self.raw_saver_queues) > 1 else ""
-                filepath = str(base_dir / f"{filename}{suffix}.tpx3")
+                filepath = str(run_dir / f"{filename}{suffix}.tpx3")
                 try:
                     q.put(("NEW_FILE", filepath), timeout=1.0)
                 except Exception as e:
                     self.logger.error(f"Failed to open raw saver file: {e}")
             active_savers.append("raw")
+            file_map["raw"] = f"{filename}.tpx3"
 
         # Send NEW_FILE to event savers
         if save_events and self.extractors.saver_queues.get("events"):
             event_queues = self.extractors.saver_queues["events"]
             for i, q in enumerate(event_queues):
                 suffix = f"_saver{i}" if len(event_queues) > 1 else ""
-                filepath = str(base_dir / f"{filename}{suffix}_events.dat")
+                filepath = str(run_dir / f"{filename}{suffix}_events.dat")
                 try:
                     q.put(("NEW_FILE", filepath), timeout=1.0)
                 except Exception as e:
                     self.logger.error(f"Failed to open event saver file: {e}")
             active_savers.append("events")
+            file_map["events"] = f"{filename}_events.dat"
 
         # Send NEW_FILE to pixel savers
         if save_pixels and self.extractors.saver_queues.get("pixels"):
             pixel_queues = self.extractors.saver_queues["pixels"]
             for i, q in enumerate(pixel_queues):
                 suffix = f"_saver{i}" if len(pixel_queues) > 1 else ""
-                filepath = str(base_dir / f"{filename}{suffix}_pixels.dat")
+                filepath = str(run_dir / f"{filename}{suffix}_pixels.dat")
                 try:
                     q.put(("NEW_FILE", filepath), timeout=1.0)
                 except Exception as e:
                     self.logger.error(f"Failed to open pixel saver file: {e}")
             active_savers.append("pixels")
+            file_map["pixels"] = f"{filename}_pixels.dat"
+
+        # Send NEW_FILE to trigger savers
+        if save_triggers and self.extractors.saver_queues.get("triggers"):
+            trigger_queues = self.extractors.saver_queues["triggers"]
+            for i, q in enumerate(trigger_queues):
+                suffix = f"_saver{i}" if len(trigger_queues) > 1 else ""
+                filepath = str(run_dir / f"{filename}{suffix}_triggers.trg")
+                try:
+                    q.put(("NEW_FILE", filepath), timeout=1.0)
+                except Exception as e:
+                    self.logger.error(f"Failed to open trigger saver file: {e}")
+            active_savers.append("triggers")
+            file_map["triggers"] = f"{filename}_triggers.trg"
 
         # Enable recording flag — workers start feeding saver queues
         self._recording_flag.value = 1
         self._recording_state = {
             "active": True,
             "filename": filename,
-            "output_dir": str(base_dir),
+            "output_dir": str(run_dir),
             "active_savers": active_savers,
         }
 
+        # Write metadata file
+        self._write_metadata(filename, run_dir, file_map)
+
         self.logger.info(f"Recording started: {filename} (savers: {active_savers})")
         return True
+
+    def _write_metadata(self, filename: str, base_dir: Path, file_map: dict):
+        """Write run metadata JSON file."""
+        ext = self.extract_config
+        meta = {
+            "format_version": "2.0",
+            "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "tdc_id": int(ext["tdc_id"]),
+            "tdc_label": TDCChannel(ext["tdc_id"]).label,
+            "edge": int(ext["edge"]),
+            "edge_label": TriggerEdge(ext["edge"]).label,
+            "event_window_ns": list(ext["event_window"]),
+            "num_workers": ext["num_workers"],
+            "centroiding": {
+                "enabled": ext.get("use_centroiding", False),
+                "eps_space_px": ext.get("eps_space", 2),
+                "eps_time_ns": ext.get("eps_time_ns", 100.0),
+                "b_size": ext.get("b_size", 16),
+            },
+            "files": {
+                "events": file_map.get("events"),
+                "triggers": file_map.get("triggers"),
+                "pixels": file_map.get("pixels"),
+                "raw": file_map.get("raw"),
+            },
+            "event_dtype": "t_trigger(f8),x(u2),y(u2),tof(f8),tot(u4)",
+            "trigger_dtype": "toa(f8),tdc_id(u1),edge(u1)",
+        }
+        meta_path = base_dir / f"{filename}_meta.json"
+        try:
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Failed to write metadata: {e}")
 
     def stop_record(self) -> bool:
         """
@@ -348,6 +422,14 @@ class TPX3PipelineV3:
                     self.logger.error(f"Error closing pixel saver: {e}", exc_info=True)
                     pass
 
+        if "triggers" in active_savers:
+            for q in self.extractors.saver_queues.get("triggers", []):
+                try:
+                    q.put(("CLOSE_FILE",), timeout=1.0)
+                except Exception as e:
+                    self.logger.error(f"Error closing trigger saver: {e}", exc_info=True)
+                    pass
+
         filename = self._recording_state.get("filename")
         self._recording_state = {
             "active": False,
@@ -368,11 +450,11 @@ class TPX3PipelineV3:
     # Pipeline lifecycle
     # =========================================================================
 
-    def _on_event_batch(self, _event, event_num, x, y, tof, tot):
+    def _on_event_batch(self, _event, t_trigger, x, y, tof, tot):
         """Forward event batches to user callback if registered."""
         if self._user_event_callback:
             try:
-                self._user_event_callback(event_num, x, y, tof, tot)
+                self._user_event_callback(t_trigger, x, y, tof, tot)
             except Exception as e:
                 self.logger.error(f"Event callback error: {e}")
 
@@ -393,8 +475,8 @@ class TPX3PipelineV3:
                 try:
                     event_data = self.callback_event_queue.get(timeout=0.05)
                     if event_data is not None:
-                        event_num, x, y, tof, tot = event_data
-                        self.event_bus.publish(Events.EVENT_BATCH, event_num, x, y, tof, tot)
+                        t_trigger, x, y, tof, tot = event_data
+                        self.event_bus.publish(Events.EVENT_BATCH, t_trigger, x, y, tof, tot)
                 except queue.Empty:
                     pass
                 except Exception as e:
@@ -414,7 +496,7 @@ class TPX3PipelineV3:
                 time.sleep(0.05)
 
     def set_event_callback(self, callback):
-        """Set callback for receiving event batches: callback(event_num, x, y, tof, tot)"""
+        """Set callback for receiving event batches: callback(t_trigger, x, y, tof, tot)"""
         self._user_event_callback = callback
 
     def set_pixel_callback(self, callback):
@@ -579,7 +661,26 @@ class TPX3PipelineV3:
                 saver.terminate()
 
         self.raw_saver_processes.clear()
+
+        # Release semaphores held by each raw saver Queue
+        for q in self.raw_saver_queues:
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                pass
         self.raw_saver_queues.clear()
+
+        # Release semaphores held by callback queues
+        for q in (self.callback_event_queue, self.callback_pixel_queue):
+            if q is not None:
+                try:
+                    q.close()
+                    q.join_thread()
+                except Exception:
+                    pass
+        self.callback_event_queue = None
+        self.callback_pixel_queue = None
 
         self.stats.stop()
         print("Shutdown complete.")
@@ -591,6 +692,7 @@ class TPX3PipelineV3:
         raw_cfg = self.save_config["raw"]
         events_cfg = self.save_config["events"]
         pixels_cfg = self.save_config["pixels"]
+        triggers_cfg = self.save_config["triggers"]
         tdc_id = ext["tdc_id"]
 
         print(f"\n{'=' * 60}")
@@ -608,6 +710,7 @@ class TPX3PipelineV3:
         print(f"  Raw: {raw_cfg['enabled']} ({raw_cfg['num_savers']} savers)")
         print(f"  Events: {events_cfg['enabled']} ({events_cfg['num_savers']} savers)")
         print(f"  Pixels: {pixels_cfg['enabled']} ({pixels_cfg['num_savers']} savers)")
+        print(f"  Triggers: {triggers_cfg['enabled']} ({triggers_cfg['num_savers']} savers)")
         callback_mode = self.callback_config.get("mode")
         print(f"Callbacks: {callback_mode or 'disabled'}")
         if self.command_config.get("enabled"):
@@ -630,6 +733,10 @@ def main():
             "use_fast_extract": True,
             "event_window": (0.0, 300_000.0),
             "tdc_id": 1,
+            "use_centroiding": True,
+            "eps_space": 2,        # pixels, Manhattan distance
+            "eps_time_ns": 100.0,  # nanoseconds
+            "b_size": 16,          # lookback buffer depth            
         },
         save_config={
             "output_dir": "./data",
@@ -646,4 +753,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method('forkserver', force=False)
     main()

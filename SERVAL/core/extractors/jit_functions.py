@@ -349,7 +349,6 @@ def correlate_pixels(
     trigger_times: np.ndarray,
     event_window_min: float,
     event_window_max: float,
-    event_offset: np.uint64,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Correlate pixels to triggers using binary search.
@@ -366,13 +365,11 @@ def correlate_pixels(
         Sorted trigger times
     event_window_min, event_window_max : float
         Time window for valid events (seconds)
-    event_offset : uint64
-        Offset for event numbering
 
     Returns
     -------
-    event_num : np.ndarray[uint64]
-        Event numbers
+    t_trigger : np.ndarray[float64]
+        Absolute trigger time for each event (seconds)
     x, y : np.ndarray[uint16]
         Pixel coordinates
     tof : np.ndarray[float64]
@@ -386,7 +383,7 @@ def correlate_pixels(
     n_triggers = len(trigger_times)
 
     # Pre-allocate output arrays
-    out_event_num = np.empty(n_pixels, dtype=np.uint64)
+    out_t_trigger = np.empty(n_pixels, dtype=np.float64)
     out_x = np.empty(n_pixels, dtype=np.uint16)
     out_y = np.empty(n_pixels, dtype=np.uint16)
     out_tof = np.empty(n_pixels, dtype=np.float64)
@@ -420,7 +417,7 @@ def correlate_pixels(
             continue
 
         # Store valid event
-        out_event_num[n_valid] = event_idx + event_offset
+        out_t_trigger[n_valid] = trigger_times[event_idx]
         out_x[n_valid] = pixel_x[i]
         out_y[n_valid] = pixel_y[i]
         out_tof[n_valid] = tof
@@ -429,13 +426,172 @@ def correlate_pixels(
 
     # Trim to actual count
     return (
-        out_event_num[:n_valid],
+        out_t_trigger[:n_valid],
         out_x[:n_valid],
         out_y[:n_valid],
         out_tof[:n_valid],
         out_tot[:n_valid],
         n_valid
     )
+
+
+# =============================================================================
+# Greedy Centroiding
+# =============================================================================
+
+@njit(cache=True)
+def centroid_hits(
+    x: np.ndarray,
+    y: np.ndarray,
+    toa: np.ndarray,
+    tot: np.ndarray,
+    eps_space: int,
+    eps_time: float,
+    b_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Greedy linear-time centroiding of raw pixel hits.
+
+    Processes hits sorted by ToA and maintains a lookback buffer of active
+    clusters. Each hit is merged into the nearest spatial neighbour within
+    eps_time, or starts a new cluster.  The representative position of a
+    cluster is the hit with the maximum ToT; the cluster ToA is the minimum
+    ToA across all member hits.
+
+    Parameters
+    ----------
+    x, y : np.ndarray[uint16]
+        Pixel coordinates (unsorted; sorted internally by ToA).
+    toa : np.ndarray[float64]
+        Time of arrival in seconds.
+    tot : np.ndarray[uint32]
+        Time over threshold.
+    eps_space : int
+        Maximum Manhattan distance (pixels) for two hits to belong to the
+        same cluster.
+    eps_time : float
+        Maximum ToA spread (seconds) within a cluster.
+    b_size : int
+        Lookback buffer depth — maximum number of simultaneously open
+        clusters.
+
+    Returns
+    -------
+    out_x, out_y : np.ndarray[uint16]
+        Centroid coordinates (position of max-ToT hit).
+    out_toa : np.ndarray[float64]
+        Centroid ToA (minimum ToA in cluster), seconds.
+    out_tot : np.ndarray[uint32]
+        Maximum ToT in cluster.
+    n_out : int
+        Number of centroids produced.
+    """
+    n = len(x)
+    if n == 0:
+        return (
+            np.empty(0, dtype=np.uint16),
+            np.empty(0, dtype=np.uint16),
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.uint32),
+            0,
+        )
+
+    # Sort by ToA
+    sort_idx = np.argsort(toa)
+
+    # Cluster buffer (int32 positions to avoid uint16 underflow in abs-diff)
+    buf_x = np.empty(b_size, dtype=np.int32)
+    buf_y = np.empty(b_size, dtype=np.int32)
+    buf_toa_min = np.empty(b_size, dtype=np.float64)
+    buf_tot_max = np.empty(b_size, dtype=np.uint32)
+    buf_active = np.zeros(b_size, dtype=np.bool_)
+
+    # Output arrays (worst case: every hit is its own cluster)
+    out_x = np.empty(n, dtype=np.uint16)
+    out_y = np.empty(n, dtype=np.uint16)
+    out_toa = np.empty(n, dtype=np.float64)
+    out_tot = np.empty(n, dtype=np.uint32)
+    n_out = 0
+    n_active = 0
+
+    for idx in range(n):
+        i = sort_idx[idx]
+        xi = np.int32(x[i])
+        yi = np.int32(y[i])
+        toai = toa[i]
+        toti = tot[i]
+
+        # Flush expired clusters (temporal gap > eps_time)
+        for k in range(b_size):
+            if buf_active[k] and toai - buf_toa_min[k] > eps_time:
+                out_x[n_out] = np.uint16(buf_x[k])
+                out_y[n_out] = np.uint16(buf_y[k])
+                out_toa[n_out] = buf_toa_min[k]
+                out_tot[n_out] = buf_tot_max[k]
+                n_out += 1
+                buf_active[k] = False
+                n_active -= 1
+
+        # Find closest active cluster within spatial threshold
+        best_k = -1
+        best_dist = eps_space + 1
+        for k in range(b_size):
+            if not buf_active[k]:
+                continue
+            dist = abs(xi - buf_x[k]) + abs(yi - buf_y[k])
+            if dist <= eps_space and dist < best_dist:
+                best_dist = dist
+                best_k = k
+
+        if best_k >= 0:
+            # Merge: update max-ToT position; toa_min stays (sorted order)
+            if toti > buf_tot_max[best_k]:
+                buf_tot_max[best_k] = toti
+                buf_x[best_k] = xi
+                buf_y[best_k] = yi
+        else:
+            # Find a free buffer slot
+            free_k = -1
+            for k in range(b_size):
+                if not buf_active[k]:
+                    free_k = k
+                    break
+
+            if free_k < 0:
+                # Buffer full: evict and flush the oldest cluster
+                oldest_k = 0
+                oldest_toa = np.float64(1e300)
+                for k in range(b_size):
+                    if buf_active[k] and buf_toa_min[k] < oldest_toa:
+                        oldest_k = k
+                        oldest_toa = buf_toa_min[k]
+                out_x[n_out] = np.uint16(buf_x[oldest_k])
+                out_y[n_out] = np.uint16(buf_y[oldest_k])
+                out_toa[n_out] = buf_toa_min[oldest_k]
+                out_tot[n_out] = buf_tot_max[oldest_k]
+                n_out += 1
+                buf_active[oldest_k] = False
+                n_active -= 1
+                free_k = oldest_k
+
+            # Open a new cluster
+            buf_x[free_k] = xi
+            buf_y[free_k] = yi
+            buf_toa_min[free_k] = toai
+            buf_tot_max[free_k] = toti
+            buf_active[free_k] = True
+            n_active += 1
+
+    # Flush all remaining active clusters
+    for k in range(b_size):
+        if buf_active[k]:
+            out_x[n_out] = np.uint16(buf_x[k])
+            out_y[n_out] = np.uint16(buf_y[k])
+            out_toa[n_out] = buf_toa_min[k]
+            out_tot[n_out] = buf_tot_max[k]
+            n_out += 1
+
+    return out_x[:n_out], out_y[:n_out], out_toa[:n_out], out_tot[:n_out], n_out
 
 
 @njit(cache=True, parallel=True)
@@ -447,7 +603,6 @@ def correlate_pixels_parallel(
     trigger_times: np.ndarray,
     event_window_min: float,
     event_window_max: float,
-    event_offset: np.uint64,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Parallel version of correlate_pixels for large datasets.
@@ -490,7 +645,7 @@ def correlate_pixels_parallel(
             n_valid += 1
 
     # Compact results
-    out_event_num = np.empty(n_valid, dtype=np.uint64)
+    out_t_trigger = np.empty(n_valid, dtype=np.float64)
     out_x = np.empty(n_valid, dtype=np.uint16)
     out_y = np.empty(n_valid, dtype=np.uint16)
     out_tof = np.empty(n_valid, dtype=np.float64)
@@ -499,11 +654,11 @@ def correlate_pixels_parallel(
     j = 0
     for i in range(n_pixels):
         if valid_mask[i]:
-            out_event_num[j] = event_indices[i] + event_offset
+            out_t_trigger[j] = trigger_times[event_indices[i]]
             out_x[j] = pixel_x[i]
             out_y[j] = pixel_y[i]
             out_tof[j] = tof_values[i]
             out_tot[j] = pixel_tot[i]
             j += 1
 
-    return out_event_num, out_x, out_y, out_tof, out_tot, n_valid
+    return out_t_trigger, out_x, out_y, out_tof, out_tot, n_valid

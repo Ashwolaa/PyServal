@@ -1,0 +1,33 @@
+# PyServal extra icons — icons NOT present in pymodaq_gui's icons.toml.
+# Do not duplicate what is already in pymodaq; just add what is missing.
+#
+# Browse all valid names at https://fonts.google.com/icons
+# Use the snake_case variant shown in the icon detail panel.
+#
+# After editing this file run:
+#   python -m SERVAL.resources.build_icons
+# from the PyServal root directory.
+
+[icons]
+size   = [20, 40]
+style  = ['rounded']
+names  = [
+    # Used in the GUI toolbar / actions
+    'broken_image',         # Toggle TOF histogram visibility
+    'format_list_bulleted', # Log dock
+    'image',                # Total image dock + ImageDockWidget image toggle
+    'settings_applications',# Display settings panel
+    'table_rows',           # ROI table
+    # Used inside ImageDockWidget header
+    'monitoring',           # Time-series / counts-over-time toggle
+    # Potentially useful additions for a detector/TOF acquisition GUI
+    'scatter_plot',
+    'sensors',
+    'analytics',
+    'hard_drive', 
+    'bar_chart',
+    'explicit',
+    'image_arrow_up',
+    'zoom_in',
+    'zoom_out',
+]

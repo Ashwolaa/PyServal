@@ -1,0 +1,26 @@
+To make the time extension, the most straightforward way is to keep track of the current time and update it as needed. 
+Since you're using Serval 4, there's a reliable way to extend timestamps without manually tracking wraparounds. Each Ethernet chunk includes minimum and maximum timestamp packets at the end (see attached PDF). Here's how to use them:
+Read the chunk header and get chunk_size (in bytes)
+Parse the body as 64-bit packets: n_packets = chunk_size // 8
+Get the minimum timestamp from body[-2] (second-to-last packet). Extract bits 53-0: this is in 1.5625 ns units.
+Extend each packet's timestamp using the formula below.
+The extension formula (Python):
+def extend_timestamp(timestamp, min_timestamp, n_bits):
+    """Extend a truncated timestamp using the chunk's minimum timestamp."""
+    bit_mask = (1 << n_bits) - 1
+    delta_t = (timestamp - min_timestamp) & bit_mask
+    return min_timestamp + delta_t
+
+For pixels (n_bits = 34)
+# Pixel time in 1.5625 ns: (((spidr_time << 14) + toa) << 4) - ftoa
+# SPIDR_time is 16 bits, ToA is 14 bits, then <<4 → 34 bits total
+pixel_time = (((spidr_time << 14) + toa) << 4) - ftoa
+extended = extend_timestamp(pixel_time, min_timestamp, n_bits=34)
+
+For TDCs (n_bits = 36)
+# TDC coarse is 35 bits in 3.125 ns. Convert to 1.5625 ns (multiply by 2).
+# After x2, the value wraps at 2^36, so use n_bits=36.
+tdc_in_1p5625ns = tdc_coarse * 2
+extended = extend_timestamp(tdc_in_1p5625ns, min_timestamp, n_bits=36)
+# Convert to 3840 MHz clock (~260.4 ps units) and add fine timestamp:
+extended_3840mhz = extended * 12 + (tdc_fine - 1)

@@ -88,7 +88,7 @@ class TPX3PipelineV3:
     }
 
     DEFAULT_COMMAND_CONFIG = {
-        "enabled": False,
+        "enabled": True,
         "port": 9100,
     }
 
@@ -137,10 +137,19 @@ class TPX3PipelineV3:
         # EventBus for inter-component communication
         self.event_bus = EventBus()
 
-        # Callback queue for GUI/live display (workers → main process)
+        # Callback queues + display-mode flag for GUI live display.
+        # Both queues are created when callbacks are enabled; the shared flag tells
+        # workers which one to write to, so only one queue is ever filled at a time.
+        # The consumer loop reads the flag and switches queues dynamically.
         callback_mode = self.callback_config.get("mode")
-        self.callback_event_queue = multiprocessing.Queue(maxsize=1000) if callback_mode == "events" else None
-        self.callback_pixel_queue = multiprocessing.Queue(maxsize=1000) if callback_mode == "pixels" else None
+        _callbacks_enabled = callback_mode is not None
+        self.callback_event_queue = multiprocessing.Queue(maxsize=1000) if _callbacks_enabled else None
+        self.callback_pixel_queue = multiprocessing.Queue(maxsize=1000) if _callbacks_enabled else None
+        # 0 = events (TOF), 1 = pixels (TOA)
+        _initial_flag = 1 if callback_mode == "pixels" else 0
+        self._callback_display_flag = (
+            multiprocessing.Value('i', _initial_flag) if _callbacks_enabled else None
+        )
         self._callback_consumer_thread = None
         self._callback_stop_event = threading.Event()
 
@@ -187,6 +196,7 @@ class TPX3PipelineV3:
             callback_event_queue=self.callback_event_queue,
             callback_pixel_queue=self.callback_pixel_queue,
             recording_flag=self._recording_flag,
+            callback_display_flag=self._callback_display_flag,
             use_centroiding=ext.get("use_centroiding", False),
             eps_space=ext.get("eps_space", 2),
             eps_time_ns=ext.get("eps_time_ns", 100.0),
@@ -430,6 +440,20 @@ class TPX3PipelineV3:
                     self.logger.error(f"Error closing trigger saver: {e}", exc_info=True)
                     pass
 
+        # Wait for all active savers to flush and close their files (max 10 s)
+        waiters = []
+        if "raw" in active_savers:
+            waiters.extend(self.raw_saver_processes)
+        for stype in ("events", "pixels", "triggers"):
+            if stype in active_savers:
+                waiters.extend(self.extractors.saver_processes.get(stype, []))
+
+        deadline = time.time() + 10.0
+        for saver in waiters:
+            remaining = max(0.0, deadline - time.time())
+            if not saver._file_closed_event.wait(timeout=remaining):
+                self.logger.warning(f"{saver.name}: timed out waiting for file close")
+
         filename = self._recording_state.get("filename")
         self._recording_state = {
             "active": False,
@@ -467,33 +491,52 @@ class TPX3PipelineV3:
                 self.logger.error(f"Pixel callback error: {e}")
 
     def _callback_consumer_loop(self):
-        """Consumer thread that reads from callback queue and publishes to EventBus."""
-        import queue
+        """Consumer thread: reads from the active callback queue and publishes to EventBus.
+
+        The active queue is determined by ``_callback_display_flag`` (0=events, 1=pixels).
+        On a mode change the newly-active queue is drained first to discard any data
+        produced before the switch, preventing stale data from reaching the GUI.
+        """
+        import queue as _queue
+
+        _prev_mode = -1  # sentinel — forces initial drain on first iteration
 
         while not self._callback_stop_event.is_set():
-            if self.callback_event_queue is not None:
-                try:
-                    event_data = self.callback_event_queue.get(timeout=0.05)
-                    if event_data is not None:
-                        t_trigger, x, y, tof, tot = event_data
-                        self.event_bus.publish(Events.EVENT_BATCH, t_trigger, x, y, tof, tot)
-                except queue.Empty:
-                    pass
-                except Exception as e:
-                    self.logger.error(f"Callback consumer error (events): {e}")
+            flag = self._callback_display_flag
+            mode = flag.value if flag is not None else 0
 
-            elif self.callback_pixel_queue is not None:
-                try:
-                    pixel_data = self.callback_pixel_queue.get(timeout=0.05)
-                    if pixel_data is not None:
-                        x, y, toa, tot = pixel_data
-                        self.event_bus.publish(Events.PIXEL_BATCH, x, y, toa, tot)
-                except queue.Empty:
-                    pass
-                except Exception as e:
-                    self.logger.error(f"Callback consumer error (pixels): {e}")
-            else:
+            # On mode change: flush the newly-active queue to discard pre-switch data
+            if mode != _prev_mode:
+                _prev_mode = mode
+                flush_q = (self.callback_event_queue if mode == 0
+                           else self.callback_pixel_queue)
+                if flush_q is not None:
+                    while True:
+                        try:
+                            flush_q.get_nowait()
+                        except Exception:
+                            break
+
+            active_q = (self.callback_event_queue if mode == 0
+                        else self.callback_pixel_queue)
+            if active_q is None:
                 time.sleep(0.05)
+                continue
+
+            try:
+                data = active_q.get(timeout=0.05)
+                if data is None:
+                    continue
+                if mode == 0:
+                    t_trigger, x, y, tof, tot = data
+                    self.event_bus.publish(Events.EVENT_BATCH, t_trigger, x, y, tof, tot)
+                else:
+                    x, y, toa, tot = data
+                    self.event_bus.publish(Events.PIXEL_BATCH, x, y, toa, tot)
+            except _queue.Empty:
+                pass
+            except Exception as e:
+                self.logger.error(f"Callback consumer error: {e}")
 
     def set_event_callback(self, callback):
         """Set callback for receiving event batches: callback(t_trigger, x, y, tof, tot)"""
@@ -507,6 +550,18 @@ class TPX3PipelineV3:
         """Set callback for status updates."""
         self.stats.status_callback = callback
 
+    def set_callback_display_mode(self, mode: str):
+        """Switch the live-display queue without restarting the pipeline.
+
+        Parameters
+        ----------
+        mode : str
+            ``'events'`` — workers write to the event (TOF) callback queue.
+            ``'pixels'`` — workers write to the pixel (TOA) callback queue.
+        """
+        if self._callback_display_flag is not None:
+            self._callback_display_flag.value = 0 if mode == 'events' else 1
+
     @property
     def is_connected(self):
         """Check if TCP connection is active."""
@@ -518,6 +573,7 @@ class TPX3PipelineV3:
         stop_event: Optional[threading.Event] = None,
         run_name: Optional[str] = None,
         auto_record: bool = False,
+        ready_callback=None,
     ):
         """
         Start the pipeline (blocking until stopped).
@@ -532,12 +588,19 @@ class TPX3PipelineV3:
             Used as auto-record filename when auto_record=True.
         auto_record : bool
             If True, immediately start recording with run_name as filename.
+        ready_callback : callable, optional
+            Called once the TCP socket is bound and all workers are running,
+            just before entering the run loop.  Safe to use from a QThread to
+            emit a "pipeline ready" signal.
         """
         self._print_config()
 
         try:
             self._setup_components()
             self._start_components()
+
+            if ready_callback is not None:
+                ready_callback()
 
             if auto_record:
                 record_name = run_name or datetime.now().strftime("acquisition_%Y%m%d_%H%M%S")
@@ -562,10 +625,17 @@ class TPX3PipelineV3:
         # Connect receiver to raw saver queues and ZMQ extractor socket
         self.receiver.set_targets(self.raw_saver_queues, zmq_socket)
 
-        # Pass queue references to stats reporter
-        self.stats.set_queues('raw', self.raw_saver_queues)
-        self.stats.set_queues('events', self.extractors.saver_queues.get('events', []))
-        self.stats.set_queues('pixels', self.extractors.saver_queues.get('pixels', []))
+        # Pass queue references to stats reporter (with declared maxsizes)
+        raw_qs = self.save_config["raw"].get("queue_size", 100)
+        ext_cfg = self.extractors.save_config
+        self.stats.set_queues('raw',      self.raw_saver_queues,
+                              maxsize=raw_qs)
+        self.stats.set_queues('events',   self.extractors.saver_queues.get('events', []),
+                              maxsize=ext_cfg['events'].get('queue_size', 1000))
+        self.stats.set_queues('pixels',   self.extractors.saver_queues.get('pixels', []),
+                              maxsize=ext_cfg['pixels'].get('queue_size', 1000))
+        self.stats.set_queues('triggers', self.extractors.saver_queues.get('triggers', []),
+                              maxsize=ext_cfg['triggers'].get('queue_size', 1000))
 
     def _start_components(self):
         """Start all saver processes, receiver thread, and ancillary threads."""
@@ -628,7 +698,7 @@ class TPX3PipelineV3:
 
     def _shutdown(self):
         """Gracefully shutdown all components."""
-        print("\nShutting down...")
+        self.logger.info("Shutting down...")
         self.running = False
 
         # Stop command server
@@ -683,7 +753,7 @@ class TPX3PipelineV3:
         self.callback_pixel_queue = None
 
         self.stats.stop()
-        print("Shutdown complete.")
+        self.logger.info("Shutdown complete.")
 
     def _print_config(self):
         """Print pipeline configuration."""
@@ -695,27 +765,31 @@ class TPX3PipelineV3:
         triggers_cfg = self.save_config["triggers"]
         tdc_id = ext["tdc_id"]
 
-        print(f"\n{'=' * 60}")
-        print("TPX3 Pipeline V3")
-        print(f"{'=' * 60}")
-        print("Connection:")
-        print(f"  Host: {conn['host']}:{conn['port']}")
-        print("Extraction:")
-        print(f"  Workers: {ext['num_workers']} ({'fast' if ext['use_fast_extract'] else 'standard'})")
+        sep = "=" * 60
+        lines = [
+            sep,
+            "TPX3 Pipeline V3",
+            sep,
+            f"Connection:  {conn['host']}:{conn['port']}",
+            f"Workers:     {ext['num_workers']} ({'fast' if ext['use_fast_extract'] else 'standard'})",
+        ]
         if events_cfg["enabled"]:
-            print(f"  TDC: {'TDC1' if tdc_id == 1 else 'TDC2' if tdc_id == 2 else 'Both'}")
-            print(f"  Event window: {ext['event_window']} ns")
-        print("Savers (idle until start_record()):")
-        print(f"  Output dir: {self.output_dir}")
-        print(f"  Raw: {raw_cfg['enabled']} ({raw_cfg['num_savers']} savers)")
-        print(f"  Events: {events_cfg['enabled']} ({events_cfg['num_savers']} savers)")
-        print(f"  Pixels: {pixels_cfg['enabled']} ({pixels_cfg['num_savers']} savers)")
-        print(f"  Triggers: {triggers_cfg['enabled']} ({triggers_cfg['num_savers']} savers)")
-        callback_mode = self.callback_config.get("mode")
-        print(f"Callbacks: {callback_mode or 'disabled'}")
+            lines.append(f"TDC:         {'TDC1' if tdc_id == 1 else 'TDC2' if tdc_id == 2 else 'Both'}")
+            lines.append(f"Event window:{ext['event_window']} ns")
+        lines += [
+            "Savers (idle until start_record()):",
+            f"  Output dir: {self.output_dir}",
+            f"  Raw:      {raw_cfg['enabled']} ({raw_cfg['num_savers']} savers)",
+            f"  Events:   {events_cfg['enabled']} ({events_cfg['num_savers']} savers)",
+            f"  Pixels:   {pixels_cfg['enabled']} ({pixels_cfg['num_savers']} savers)",
+            f"  Triggers: {triggers_cfg['enabled']} ({triggers_cfg['num_savers']} savers)",
+            f"Callbacks:   {self.callback_config.get('mode') or 'disabled'}",
+        ]
         if self.command_config.get("enabled"):
-            print(f"Command server: port {self.command_config['port']}")
-        print(f"{'=' * 60}\n")
+            lines.append(f"Command server: port {self.command_config['port']}")
+        lines.append(sep)
+        for line in lines:
+            self.logger.info(line)
 
 
 def main():

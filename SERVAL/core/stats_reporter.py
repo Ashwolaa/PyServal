@@ -10,6 +10,7 @@ import time
 from typing import Optional, Callable, Dict, List
 
 from SERVAL.utils import EventBus, Events
+from SERVAL.utils.logging import get_logger
 
 
 class StatsReporter:
@@ -32,6 +33,7 @@ class StatsReporter:
         event_bus: Optional[EventBus] = None,
         report_interval: float = 5.0,
     ):
+        self.logger = get_logger('SERVAL.StatsReporter')
         self.bus = event_bus
         self.report_interval = report_interval
 
@@ -52,12 +54,15 @@ class StatsReporter:
         # Connection state
         self.is_connected = False
 
-        # Queue references for size reporting
+        # Queue references for size reporting (list of queues per type)
         self.queues: Dict[str, List] = {
             'raw': [],
             'events': [],
             'pixels': [],
+            'triggers': [],
         }
+        # Corresponding maxsizes (set via set_queues)
+        self._queue_maxsizes: Dict[str, int] = {}
 
         # Thread control
         self.running = False
@@ -103,17 +108,20 @@ class StatsReporter:
         with self._lock:
             self._stats[stat_name] = self._stats.get(stat_name, 0) + value
 
-    def set_queues(self, queue_type: str, queues: List):
+    def set_queues(self, queue_type: str, queues: List, maxsize: int = 0):
         """Set queue references for size reporting.
 
         Parameters
         ----------
         queue_type : str
-            Type of queue ('raw', 'events', 'pixels')
+            Type of queue ('raw', 'events', 'pixels', 'triggers')
         queues : List
             List of queue objects
+        maxsize : int
+            Declared maxsize of each queue (used in fill-level display)
         """
         self.queues[queue_type] = queues
+        self._queue_maxsizes[queue_type] = maxsize
 
     def get_stats(self) -> dict:
         """Get current stats snapshot."""
@@ -150,7 +158,7 @@ class StatsReporter:
 
     def _run(self):
         """Main reporter loop."""
-        print("[Stats] Starting")
+        self.logger.debug("Starting")
 
         try:
             while self.running:
@@ -158,7 +166,7 @@ class StatsReporter:
                 self._report()
 
         finally:
-            print("[Stats] Shutting down")
+            self.logger.debug("Shutting down")
 
     def _report(self):
         """Generate and output stats report."""
@@ -166,48 +174,44 @@ class StatsReporter:
         current_time = time.time()
         elapsed = stats.get('elapsed', 0)
 
-        # Calculate rates
+        # Calculate rates (MB/s)
         bytes_delta = stats['bytes_received'] - self._last_bytes
         time_delta = current_time - self._last_time
 
-        instant_rate_mbps = (bytes_delta / time_delta) / 1e6 * 8 if time_delta > 0 else 0
-        avg_rate_mbps = (stats['bytes_received'] / elapsed) / 1e6 * 8 if elapsed > 0 else 0
+        instant_rate_mbs = (bytes_delta / time_delta) / 1e6 if time_delta > 0 else 0
+        avg_rate_mbs = (stats['bytes_received'] / elapsed) / 1e6 if elapsed > 0 else 0
 
         # Get queue sizes for all types (per-queue breakdown)
         queue_stats = {}
         for qtype, qlist in self.queues.items():
             if qlist:
                 try:
-                    per_queue = [(q.qsize(), q._maxsize) for q in qlist]
-                    queue_stats[qtype] = per_queue
-                except (NotImplementedError, AttributeError):
+                    maxsize = self._queue_maxsizes.get(qtype, 0)
+                    queue_stats[qtype] = [(q.qsize(), maxsize) for q in qlist]
+                except NotImplementedError:
                     queue_stats[qtype] = [(0, 0) for _ in qlist]
             else:
                 queue_stats[qtype] = None
 
         # Build queue status string with per-process breakdown
         queue_parts = []
-        for qtype in ['raw', 'events', 'pixels']:
+        for qtype in ['raw', 'events', 'pixels', 'triggers']:
             qs = queue_stats.get(qtype)
-            if qs is not None and len(qs) > 0:
+            if qs:
                 if len(qs) == 1:
-                    # Single queue - simple format
                     queue_parts.append(f"{qtype}={qs[0][0]}/{qs[0][1]}")
                 else:
-                    # Multiple queues - show each
                     per_q = ",".join(f"{s}/{m}" for s, m in qs)
                     queue_parts.append(f"{qtype}=[{per_q}]")
         queue_str = " | ".join(queue_parts) if queue_parts else "none"
 
-        # Console output
-        print(f"\n{'='*80}")
-        print(f"[Stats] Session: {elapsed:.1f}s | Total: {stats['bytes_received']/1e9:.2f} GB")
-        print(f"[Stats] Rate: {instant_rate_mbps:.1f} Mbps (instant) | {avg_rate_mbps:.1f} Mbps (avg)")
-        print(f"[Stats] Chunks: {stats['chunks_sent']} sent | "
-              f"Dropped: {stats['chunks_dropped_save']} save, {stats['chunks_dropped_zmq']} zmq")
-        print(f"[Stats] Queues: {queue_str}")
-        print(f"[Stats] Connected: {self.is_connected}")
-        print(f"{'='*80}\n")
+        self.logger.info(
+            f"Session: {elapsed:.1f}s | {stats['bytes_received']/1e9:.2f} GB | "
+            f"{instant_rate_mbs:.1f} MB/s ({avg_rate_mbs:.1f} avg) | "
+            f"Chunks: {stats['chunks_sent']} sent, "
+            f"dropped: {stats['chunks_dropped_save']} save / {stats['chunks_dropped_zmq']} zmq | "
+            f"Queues: {queue_str}"
+        )
 
         # Callback for GUI
         if self.status_callback:
@@ -217,8 +221,8 @@ class StatsReporter:
                     'connected': self.is_connected,
                     'elapsed': elapsed,
                     'bytes_received': stats['bytes_received'],
-                    'rate_mbps': instant_rate_mbps,
-                    'avg_rate_mbps': avg_rate_mbps,
+                    'rate_mbs': instant_rate_mbs,
+                    'avg_rate_mbs': avg_rate_mbs,
                     'chunks_sent': stats['chunks_sent'],
                     'chunks_dropped_save': stats['chunks_dropped_save'],
                     'chunks_dropped_zmq': stats['chunks_dropped_zmq'],
@@ -226,7 +230,7 @@ class StatsReporter:
                 }
                 self.status_callback(status_dict)
             except Exception as e:
-                print(f"[Stats] Callback error: {e}")
+                self.logger.error(f"Callback error: {e}")
 
         # Update for next iteration
         self._last_bytes = stats['bytes_received']
@@ -237,13 +241,9 @@ class StatsReporter:
         stats = self.get_stats()
         elapsed = stats.get('elapsed', 0)
 
-        print(f"\n{'='*80}")
-        print("FINAL STATISTICS")
-        print(f"{'='*80}")
-        print(f"Duration:       {elapsed:.1f}s")
-        print(f"Total data:     {stats['bytes_received']/1e9:.2f} GB")
-        if elapsed > 0:
-            print(f"Average rate:   {(stats['bytes_received']/elapsed)/1e6*8:.1f} Mbps")
-        print(f"Chunks sent:    {stats['chunks_sent']}")
-        print(f"Chunks dropped: {stats['chunks_dropped_save']} save, {stats['chunks_dropped_zmq']} zmq")
-        print(f"{'='*80}\n")
+        avg = f"{(stats['bytes_received']/elapsed)/1e6:.1f} MB/s" if elapsed > 0 else "n/a"
+        self.logger.info(
+            f"Final — duration: {elapsed:.1f}s | data: {stats['bytes_received']/1e9:.2f} GB | "
+            f"avg rate: {avg} | chunks sent: {stats['chunks_sent']} | "
+            f"dropped: {stats['chunks_dropped_save']} save / {stats['chunks_dropped_zmq']} zmq"
+        )

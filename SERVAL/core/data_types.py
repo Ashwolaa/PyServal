@@ -13,6 +13,35 @@ import numpy as np
 
 
 # =============================================================================
+# On-disk record dtypes  (single source of truth — import from here everywhere)
+# =============================================================================
+
+#: Correlated event record written by EventSaverProcess / read by TPX3Run.
+EVENT_DTYPE = np.dtype([
+    ("t_trigger", "<f8"),  # absolute trigger time (seconds)
+    ("x",         "<u2"),
+    ("y",         "<u2"),
+    ("tof",       "<f8"),  # time-of-flight (seconds)
+    ("tot",       "<u4"),
+])
+
+#: Raw pixel record written by PixelSaverProcess / read by TPX3Run.
+PIXEL_DTYPE = np.dtype([
+    ("x",   "<u2"),
+    ("y",   "<u2"),
+    ("toa", "<f8"),  # time of arrival (seconds)
+    ("tot", "<u4"),
+])
+
+#: Trigger record written by TriggerSaverProcess / read by TPX3Run.
+TRIGGER_DTYPE = np.dtype([
+    ("toa",    "<f8"),  # absolute time (seconds)
+    ("tdc_id", "<u1"),  # 1 = TDC1, 2 = TDC2
+    ("edge",   "<u1"),  # 0 = rising, 1 = falling
+])
+
+
+# =============================================================================
 # Enumerations
 # =============================================================================
 

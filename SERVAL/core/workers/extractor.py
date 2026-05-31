@@ -7,6 +7,7 @@ ExtractorPool: Manages multiple extraction workers
 """
 
 import multiprocessing
+import queue
 import time
 from pathlib import Path
 from typing import Optional
@@ -57,6 +58,7 @@ class ExtractorWorker(multiprocessing.Process):
         callback_pixel_queue: Optional[multiprocessing.Queue] = None,  # For GUI callbacks
         callback_trigger_queue: Optional[multiprocessing.Queue] = None,  # For GUI callbacks
         recording_flag=None,  # multiprocessing.Value('b', 0) — gates saver queue puts
+        callback_display_flag=None,  # multiprocessing.Value('i') — 0=events, 1=pixels
     ):
         super().__init__(name=f"Extractor-{worker_id}")
         self.worker_id = worker_id
@@ -76,6 +78,7 @@ class ExtractorWorker(multiprocessing.Process):
         self.event_window_max = event_window[1] * 1e-9
         self.write_buffer_size = write_buffer_size
         self.recording_flag = recording_flag
+        self.callback_display_flag = callback_display_flag
         self.use_centroiding = use_centroiding
         self.eps_space = eps_space
         self.eps_time = eps_time_ns * 1e-9  # convert to seconds
@@ -154,7 +157,10 @@ class ExtractorWorker(multiprocessing.Process):
                     if self.trigger_queue is not None and (
                         self.recording_flag is None or self.recording_flag.value
                     ):
-                        self.trigger_queue.put(trigger_data)
+                        try:
+                            self.trigger_queue.put(trigger_data, timeout=1.0)
+                        except queue.Full:
+                            logger.warning("Trigger saver queue full, dropped chunk")
                     if self.callback_trigger_queue is not None:
                         try:
                             self.callback_trigger_queue.put_nowait(trigger_data)
@@ -168,9 +174,15 @@ class ExtractorWorker(multiprocessing.Process):
                     if self.pixel_queue is not None and (
                         self.recording_flag is None or self.recording_flag.value
                     ):
-                        self.pixel_queue.put(pixel_data)
-                    # Callback queue (for GUI) — always unconditional
-                    if self.callback_pixel_queue is not None:
+                        try:
+                            self.pixel_queue.put(pixel_data, timeout=1.0)
+                        except queue.Full:
+                            logger.warning("Pixel saver queue full, dropped chunk")
+                    # Callback queue (for GUI) — only when display_flag selects pixels (1)
+                    _dflag = self.callback_display_flag
+                    if self.callback_pixel_queue is not None and (
+                        _dflag is None or _dflag.value == 1
+                    ):
                         try:
                             self.callback_pixel_queue.put_nowait(pixel_data)
                         except Exception:
@@ -194,11 +206,6 @@ class ExtractorWorker(multiprocessing.Process):
                 if len(trigger_times) < 2:
                     continue
 
-                if False: # DEBUG triggers should always be sorted
-                    # Ensure sorted (required for binary search)
-                    if not np.all(trigger_times[:-1] <= trigger_times[1:]):
-                        trigger_times = np.sort(trigger_times)
-
                 # JIT correlation
                 t_trigger, ex, ey, etof, etot, n_valid = self.correlate_func(
                     pixels.toa,
@@ -221,9 +228,15 @@ class ExtractorWorker(multiprocessing.Process):
                 if self.event_queue is not None and (
                     self.recording_flag is None or self.recording_flag.value
                 ):
-                    self.event_queue.put(event_data)
-                # Callback queue (for GUI) — always unconditional
-                if self.callback_event_queue is not None:
+                    try:
+                        self.event_queue.put(event_data, timeout=1.0)
+                    except queue.Full:
+                        logger.warning("Event saver queue full, dropped chunk")
+                # Callback queue (for GUI) — only when display_flag selects events (0)
+                _dflag = self.callback_display_flag
+                if self.callback_event_queue is not None and (
+                    _dflag is None or _dflag.value == 0
+                ):
                     try:
                         self.callback_event_queue.put_nowait(event_data)
                     except Exception:
@@ -296,6 +309,7 @@ class ExtractorPool:
         callback_event_queue: Optional[multiprocessing.Queue] = None,
         callback_pixel_queue: Optional[multiprocessing.Queue] = None,
         recording_flag=None,  # multiprocessing.Value — gates saver queue puts
+        callback_display_flag=None,  # multiprocessing.Value('i') — 0=events, 1=pixels
         use_centroiding: bool = False,
         eps_space: int = 2,
         eps_time_ns: float = 100.0,
@@ -313,6 +327,7 @@ class ExtractorPool:
         self.callback_event_queue = callback_event_queue
         self.callback_pixel_queue = callback_pixel_queue
         self.recording_flag = recording_flag
+        self.callback_display_flag = callback_display_flag
         self.use_centroiding = use_centroiding
         self.eps_space = eps_space
         self.eps_time_ns = eps_time_ns
@@ -417,6 +432,7 @@ class ExtractorPool:
                 edge=self.edge,
                 event_window=self.event_window,
                 recording_flag=self.recording_flag,
+                callback_display_flag=self.callback_display_flag,
                 use_centroiding=self.use_centroiding,
                 eps_space=self.eps_space,
                 eps_time_ns=self.eps_time_ns,

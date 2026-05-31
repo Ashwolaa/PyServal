@@ -4,7 +4,6 @@ Histogram Controller
 Thread-safe histogram accumulation for real-time visualization.
 Supports multiple TOF ROI regions for filtered 2D images.
 """
-# import cupy as cp
 
 import time
 import threading
@@ -44,13 +43,6 @@ class HistogramController:
 
         # Multiple ROIs: name -> {"tof_min": float, "tof_max": float, "hist": np.ndarray}
         self._rois = OrderedDict()
-
-        # Raw data buffer for ROI recalculation (limited size)
-        self._max_buffer_size = 1_000_000  # Max events to buffer
-        self._x_buffer = []
-        self._y_buffer = []
-        self._tof_buffer = []
-
 
         self.xedges = np.arange(257)
         self.yedges = np.arange(257)
@@ -98,11 +90,6 @@ class HistogramController:
 
             # Convert TOF from seconds to nanoseconds
             tof_ns = tof * 1e9
-            # x_gpu = cp.asarray(x_clipped)
-            # y_gpu = cp.asarray(y_clipped)
-            # H, _, _ = cp.histogram2d(x_gpu, y_gpu,
-            #                           bins=[cp.asarray(self.xedges),cp.asarray(self.yedges)])
-            # hist = cp.asnumpy(H)  # Convert back to CPU if needed
             # Update total pixel histogram
             hist, _, _ = np.histogram2d(
                 x_clipped, y_clipped,
@@ -136,7 +123,7 @@ class HistogramController:
             # Update stats
             self._total_events += len(x)
 
-    def add_pixels(self, x, y, _toa, _tot):
+    def add_pixels(self, x, y, toa, _tot):
         """
         Add raw pixel data (without event correlation).
 
@@ -147,7 +134,7 @@ class HistogramController:
         y : np.ndarray
             Y coordinates (0-255)
         toa : np.ndarray
-            Time of arrival
+            Time of arrival in seconds (converted to ns internally)
         tot : np.ndarray
             Time over threshold
         """
@@ -160,10 +147,27 @@ class HistogramController:
 
             hist, _, _ = np.histogram2d(
                 x_clipped, y_clipped,
-                bins=[256, 256],
+                bins=[self.xedges, self.yedges],
                 range=[[0, 256], [0, 256]]
             )
             self._pixel_hist += hist.astype(np.int64)
+
+            # Fill TOA histogram (reuses the same axis as TOF)
+            toa_ns = toa * 1e9
+            toa_hist, _ = np.histogram(toa_ns, bins=self._tof_edges)
+            self._tof_counts += toa_hist.astype(np.int64)
+
+            # Update ROI histograms filtered by TOA range
+            for _roi_name, roi_data in self._rois.items():
+                roi_mask = (toa_ns >= roi_data["tof_min"]) & (toa_ns <= roi_data["tof_max"])
+                if np.any(roi_mask):
+                    roi_hist, _, _ = np.histogram2d(
+                        x_clipped[roi_mask], y_clipped[roi_mask],
+                        bins=[self.xedges, self.yedges],
+                        range=[[0, 256], [0, 256]]
+                    )
+                    roi_data["hist"] += roi_hist.astype(np.int64)
+
             self._total_pixels += len(x)
 
     def get_pixel_image(self):
@@ -232,7 +236,8 @@ class HistogramController:
 
             delta_counts = current_pixel_count - self._last_sampled_pixel_count
             delta_triggers = current_trigger_num - self._last_sampled_trigger_num
-            rate = delta_counts / delta_triggers if delta_triggers > 0 else 0.0
+            # In trigger mode: counts/shot.  In pixel mode (no triggers): raw count delta.
+            rate = delta_counts / delta_triggers if delta_triggers > 0 else float(delta_counts)
 
             self._last_sampled_pixel_count = current_pixel_count
             self._last_sampled_trigger_num = current_trigger_num
@@ -241,14 +246,13 @@ class HistogramController:
             if len(self._total_timeseries) > self._max_timeseries_points:
                 self._total_timeseries.pop(0)
 
-            # Add ROI counts/shot samples
+            # Add ROI counts/shot (or counts/refresh in pixel mode) samples
             for roi_data in self._rois.values():
                 roi_counts = int(roi_data["hist"].sum())
                 last_roi_count = roi_data.get("last_sampled_count", 0)
-                last_roi_trigger = roi_data.get("last_sampled_trigger", 0)
 
                 delta_roi = roi_counts - last_roi_count
-                roi_rate = delta_roi / delta_triggers if delta_triggers > 0 else 0.0
+                roi_rate = delta_roi / delta_triggers if delta_triggers > 0 else float(delta_roi)
 
                 roi_data["last_sampled_count"] = roi_counts
                 roi_data["last_sampled_trigger"] = current_trigger_num
@@ -306,9 +310,6 @@ class HistogramController:
             self._tof_counts.fill(0)
             self._total_events = 0
             self._total_pixels = 0
-            self._x_buffer.clear()
-            self._y_buffer.clear()
-            self._tof_buffer.clear()
 
             # Reset per-sample baselines so next timeseries point measures from zero
             self._last_sampled_pixel_count = 0
@@ -366,21 +367,6 @@ class HistogramController:
                 "timeseries": [],
             }
 
-            # Calculate from buffered data
-            if self._x_buffer:
-                x_all = np.concatenate(self._x_buffer)
-                y_all = np.concatenate(self._y_buffer)
-                tof_all = np.concatenate(self._tof_buffer)
-
-                roi_mask = (tof_all >= tof_min) & (tof_all <= tof_max)
-                if np.any(roi_mask):
-                    roi_hist, _, _ = np.histogram2d(
-                        x_all[roi_mask], y_all[roi_mask],
-                        bins=[256, 256],
-                        range=[[0, 256], [0, 256]]
-                    )
-                    self._rois[name]["hist"] = roi_hist.astype(np.int64)
-
     def update_roi(self, name, tof_min, tof_max):
         """
         Update an existing ROI's range.
@@ -401,21 +387,9 @@ class HistogramController:
             self._rois[name]["tof_min"] = tof_min
             self._rois[name]["tof_max"] = tof_max
             self._rois[name]["hist"].fill(0)
-
-            # Recalculate from buffered data
-            if self._x_buffer:
-                x_all = np.concatenate(self._x_buffer)
-                y_all = np.concatenate(self._y_buffer)
-                tof_all = np.concatenate(self._tof_buffer)
-
-                roi_mask = (tof_all >= tof_min) & (tof_all <= tof_max)
-                if np.any(roi_mask):
-                    roi_hist, _, _ = np.histogram2d(
-                        x_all[roi_mask], y_all[roi_mask],
-                        bins=[256, 256],
-                        range=[[0, 256], [0, 256]]
-                    )
-                    self._rois[name]["hist"] = roi_hist.astype(np.int64)
+            # Reset timeseries baselines so the next sample measures from zero
+            self._rois[name]["last_sampled_count"] = 0
+            self._rois[name]["last_sampled_trigger"] = 0
 
     def remove_roi(self, name):
         """

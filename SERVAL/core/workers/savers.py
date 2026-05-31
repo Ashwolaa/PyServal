@@ -6,27 +6,7 @@ from pathlib import Path
 from typing import Optional, Union, Any
 import numpy as np
 
-# Event data dtype (must match ExtractorWorker output)
-EVENT_DTYPE = np.dtype([
-    ("t_trigger", "<f8"),  # absolute trigger time (seconds)
-    ("x", "<u2"),
-    ("y", "<u2"),
-    ("tof", "<f8"),
-    ("tot", "<u4"),
-])
-# Pixel data dtype (no correlation, raw pixel data)
-PIXEL_DTYPE = np.dtype([
-    ("x", "<u2"),
-    ("y", "<u2"),
-    ("toa", "<f8"),
-    ("tot", "<u4"),
-])
-# Trigger data dtype
-TRIGGER_DTYPE = np.dtype([
-    ("toa", "<f8"),      # absolute time in seconds
-    ("tdc_id", "<u1"),   # 1 or 2
-    ("edge", "<u1"),     # 0 = rising, 1 = falling
-])
+from SERVAL.core.data_types import EVENT_DTYPE, PIXEL_DTYPE, TRIGGER_DTYPE
 
 class BaseSaverProcess(multiprocessing.Process, ABC):
     def __init__(
@@ -45,6 +25,8 @@ class BaseSaverProcess(multiprocessing.Process, ABC):
         self.log_interval = log_interval
         self.use_np_save = use_np_save
         self._stop_event = multiprocessing.Event()
+        self._file_closed_event = multiprocessing.Event()
+        self._file_closed_event.set()  # initially "closed" (no file open)
         self._file = None
         self._buffer = None
         self._buffer_pos = 0
@@ -84,6 +66,7 @@ class BaseSaverProcess(multiprocessing.Process, ABC):
         self._total_write_time = 0.0
         self._total_queue_time = 0.0
         self._start_time = time.time()
+        self._file_closed_event.clear()
         self._logger.info(f"Recording to {filepath}")
 
     def _close_file(self):
@@ -96,6 +79,7 @@ class BaseSaverProcess(multiprocessing.Process, ABC):
             rate_mb = (self._total_items * self._item_size / 1e6) / elapsed if elapsed > 0 else 0
             self._logger.info(f"Closed ({self._total_items:,} items at {rate_mb:.1f} MB/s)")
             self._file = None
+            self._file_closed_event.set()
 
     def run(self):
         from SERVAL.utils.logging import set_log_level, get_logger

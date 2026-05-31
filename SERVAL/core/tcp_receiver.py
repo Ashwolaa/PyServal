@@ -137,13 +137,11 @@ class TCPReceiver:
         """
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.socket_buffer_size)
-        self.server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(1)
 
         actual_buffer = self.server_socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-        print(f"[TCPReceiver] Listening on {self.host}:{self.port} (buffer: {actual_buffer/1024/1024:.1f} MB)")
+        self.logger.info(f"Listening on {self.host}:{self.port} (buffer: {actual_buffer/1024/1024:.1f} MB)")
         return actual_buffer
 
     def start(self):
@@ -174,7 +172,7 @@ class TCPReceiver:
 
     def _run(self):
         """Main receiver loop with connection management."""
-        print("[TCPReceiver] Starting - waiting for connections...")
+        self.logger.info("Starting - waiting for connections...")
 
         while self.running:
             connection = self._accept_connection()
@@ -183,7 +181,7 @@ class TCPReceiver:
 
             self._receive_loop(connection)
 
-        print("[TCPReceiver] Shutting down")
+        self.logger.info("Shutting down")
 
     def _accept_connection(self) -> Optional[socket.socket]:
         """Wait for and accept a connection."""
@@ -193,15 +191,17 @@ class TCPReceiver:
             try:
                 connection, client_address = self.server_socket.accept()
                 connection.settimeout(1.0)
+                connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.socket_buffer_size)
+                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.current_connection = connection
                 self._set_connected(True, client_address)
-                print(f"[TCPReceiver] Connected from {client_address}")
+                self.logger.info(f"Connected from {client_address}")
                 return connection
             except socket.timeout:
                 continue
             except OSError as e:
                 if self.running:
-                    print(f"[TCPReceiver] Accept error: {e}")
+                    self.logger.error(f"Accept error: {e}")
                 return None
 
         return None
@@ -220,7 +220,7 @@ class TCPReceiver:
                         self.recv_buffer_size
                     )
                     if nbytes == 0:
-                        print("[TCPReceiver] Connection closed by remote")
+                        self.logger.info("Connection closed by remote")
                         break
 
                     bytes_in_buffer += nbytes
@@ -249,17 +249,19 @@ class TCPReceiver:
                         data_unflushed = self._flush_buffer(current_view, bytes_in_buffer)
                         self.ring_buffer_index = (self.ring_buffer_index + 1) % self.num_ring_buffers
                         current_view = self.ring_buffer_views[self.ring_buffer_index]
-                        bytes_in_buffer = 0
+                        # Carry forward any unflushed partial-chunk data (same as non-timeout path)
+                        unflushed_len = len(data_unflushed)
+                        if unflushed_len:
+                            current_view[:unflushed_len] = data_unflushed
+                        bytes_in_buffer = unflushed_len
                         last_flush_time = time.time()
 
                 except (ConnectionResetError, BrokenPipeError) as e:
-                    print(f"[TCPReceiver] Connection lost: {e}")
+                    self.logger.warning(f"Connection lost: {e}")
                     break
 
                 except Exception as e:
-                    print(f"[TCPReceiver] Error: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    self.logger.exception(f"Receive error: {e}")
                     break
 
         finally:
@@ -277,12 +279,12 @@ class TCPReceiver:
             self._set_connected(False)
 
             if self.running:
-                print("[TCPReceiver] Waiting for new connection...")
+                self.logger.info("Waiting for new connection...")
 
     def _flush_buffer(self, view: memoryview, nbytes: int):
         """Send buffered data to save queues (round-robin) and ZMQ."""
         data = bytes(view[:nbytes])
-        last_chunk_index = find_last_pattern(data, pattern=b"TPX3") # Faster than rfind
+        last_chunk_index = find_last_pattern(data, pattern=b"TPX3")
         if last_chunk_index == -1:
             return data  # No complete chunk found, keep all data unflushed
         else:
@@ -296,7 +298,7 @@ class TCPReceiver:
                     current_queue.put_nowait(data_flushed)
                 except queue.Full:
                     self._publish(Events.CHUNK_DROPPED_SAVE)
-                    print("[TCPReceiver] WARNING: Save queue full, dropped chunk")
+                    self.logger.warning("Save queue full, dropped chunk")
 
             # Send to ZMQ
             if self.zmq_socket:
@@ -305,7 +307,7 @@ class TCPReceiver:
                     self._publish(Events.CHUNK_SENT, nbytes)
                 except zmq.Again:
                     self._publish(Events.CHUNK_DROPPED_ZMQ)
-                    print("[TCPReceiver] WARNING: ZMQ send would block, dropped chunk")
+                    self.logger.warning("ZMQ send would block, dropped chunk")
 
             # Move unflushed data to start of next buffer
             return data_unflushed

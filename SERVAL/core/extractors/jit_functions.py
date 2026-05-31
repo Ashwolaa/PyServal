@@ -639,10 +639,7 @@ def correlate_pixels_parallel(
                 valid_mask[i] = True
 
     # Count valid
-    n_valid = 0
-    for i in range(n_pixels):
-        if valid_mask[i]:
-            n_valid += 1
+    n_valid = np.count_nonzero(valid_mask)
 
     # Compact results
     out_t_trigger = np.empty(n_valid, dtype=np.float64)

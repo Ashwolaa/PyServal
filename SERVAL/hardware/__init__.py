@@ -7,12 +7,16 @@ Contains data source abstractions for different acquisition hardware:
 - Tpx3CAMSource: Direct camera access via UDP (pymepix-style)
 """
 
-from .data_source import DataSource
-from .serval_source import SERVALSource
-from .tpx3cam_source import Tpx3CAMSource
+try:
+    from .data_source import DataSource
+    from .serval_source import SERVALSource
+    from .tpx3cam_source import Tpx3CAMSource
 
-__all__ = [
-    'DataSource',
-    'SERVALSource',
-    'Tpx3CAMSource',
-]
+    __all__ = [
+        'DataSource',
+        'SERVALSource',
+        'Tpx3CAMSource',
+    ]
+except ImportError:
+    # Source files not yet available; hardware submodule is non-functional.
+    __all__ = []

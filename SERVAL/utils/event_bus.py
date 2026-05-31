@@ -5,9 +5,12 @@ Event Bus - Publish/Subscribe mechanism for SERVAL components.
 Provides decoupled communication between pipeline components.
 """
 
+import logging
 import threading
 from collections import defaultdict
 from typing import Callable, Optional, Set
+
+_logger = logging.getLogger('SERVAL.EventBus')
 
 
 class EventBus:
@@ -102,10 +105,10 @@ class EventBus:
         count = 0
         for callback in callbacks:
             try:
-                callback(event, *args, **kwargs) if event != '*' else callback(event, *args, **kwargs)
+                callback(event, *args, **kwargs)
                 count += 1
-            except Exception as e:
-                print(f"[EventBus] Error in subscriber for '{event}': {e}")
+            except Exception:
+                _logger.exception(f"Error in subscriber for '{event}'")
 
         return count
 

@@ -451,106 +451,12 @@ class SERVALController(QObject):
             raise
 
 
-def test_serval_control():
-    """Test SERVAL control module"""
-    import sys
-    import time
-    from qtpy.QtWidgets import QApplication
-
-    # Enable debug logging for tests
-    set_log_level('DEBUG')
-
-    _app = QApplication(sys.argv)  # Required for Qt signals
-
-    serval = SERVALController(host='192.168.1.1', port=8080)
-
-    logger.info("Testing SERVAL connection...")
-    if not serval.connect():
-        logger.error("Connection failed (SERVAL may not be available)")
-        return
-
-    # Test get config
-    try:
-        config = serval.get_config()
-        logger.info("Got detector config: %s", list(config.keys()))
-    except Exception as e:
-        logger.error("Get config failed: %s", e)
-
-    config['GlobalTimestampInterval'] = 0.0
-    serval.set_config(config)
-    # Test bias setting
-    serval.set_bias(50, enabled=True)
-
-    # Test measurement config
-    try:
-        config = serval.get_measurement_config()
-        logger.info("Got measurement config: %s", list(config.keys()))
-    except Exception as e:
-        logger.error("Get measurement config failed: %s", e)
-
-    # Test trigger settings
-    serval.set_trigger_settings('CONTINUOUS', -1, 0.5, 0.010)
-
-    # Test destination with host/port
-    serval.set_destination('192.168.1.2', 8088)
-
-    # Test destination with dict
-    destination = {
-        "Raw": [{
-            "Base": "tcp://connect@192.168.1.2:8088",
-            "FilePattern": "f%Hms_",
-            "QueueSize": 16384,
-        }],      
-    }
-    serval.set_destination(destination=destination)
-
-    # Verify destination
-    try:
-        current_dest = serval.get_destination()
-        logger.debug("Current destination: %s", json.dumps(current_dest, indent=2))
-    except Exception as e:
-        logger.error("Get destination failed: %s", e)
-
-    # Test dashboard
-    try:
-        dashboard = serval.get_dashboard()
-        logger.info("Dashboard keys: %s", list(dashboard.keys()))
-    except Exception as e:
-        logger.error("Get dashboard failed: %s", e)
-
-    logger.info("All tests completed")
-
-    # Run measurement loop
-    measurement_duration = -1  # Duration in seconds (-1 = infinite, run until Ctrl+C)
-    if measurement_duration == -1:
-        logger.info("Running until Ctrl+C...")
-    else:
-        logger.info("Running for %d seconds...", measurement_duration)
-
-    serval.start_measurement()
-    try:
-        start_time = time.time()
-        while True:
-            time.sleep(1)
-            serval.get_dashboard()
-
-            if measurement_duration > 0:
-                elapsed = time.time() - start_time
-                if elapsed >= measurement_duration:
-                    logger.info("%d seconds elapsed - stopping measurement", measurement_duration)
-                    break
-
-                remaining = measurement_duration - elapsed
-                if remaining > 0 and int(remaining) % 5 == 0:
-                    logger.info("  %d seconds remaining...", int(remaining))
-    except KeyboardInterrupt:
-        logger.info("Ctrl+C detected")
-
-    logger.info("Stopping measurement...")
-    start = time.time()
-    serval.stop_measurement()
-    logger.info("Measurement stopped in %.2f seconds", time.time() - start)
-
-
 if __name__ == '__main__':
-    test_serval_control()
+    # Run: python -m SERVAL.controllers.serval_control
+    # (or use scripts/test_serval_control.py for a full integration test)
+    import sys
+    from qtpy.QtWidgets import QApplication
+    _app = QApplication(sys.argv)
+    set_log_level('DEBUG')
+    ctrl = SERVALController(host='192.168.1.1', port=8080)
+    print("Connected:", ctrl.connect())

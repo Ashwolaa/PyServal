@@ -150,6 +150,14 @@ class TPX3PipelineV3:
         self._callback_display_flag = (
             multiprocessing.Value('i', _initial_flag) if _callbacks_enabled else None
         )
+        # Fraction (0-1] of each chunk's pixels/events forwarded to the GUI
+        # callback queues. Subsampling happens in the worker, before the
+        # multiprocessing.Queue transfer, so the IPC payload (and its pipe-
+        # transport cost) shrinks proportionally. 1.0 = no subsampling.
+        _initial_fraction = self.callback_config.get("display_fraction", 1.0)
+        self._callback_display_fraction = (
+            multiprocessing.Value('d', _initial_fraction) if _callbacks_enabled else None
+        )
         self._callback_consumer_thread = None
         self._callback_stop_event = threading.Event()
 
@@ -197,6 +205,7 @@ class TPX3PipelineV3:
             callback_pixel_queue=self.callback_pixel_queue,
             recording_flag=self._recording_flag,
             callback_display_flag=self._callback_display_flag,
+            callback_display_fraction=self._callback_display_fraction,
             use_centroiding=ext.get("use_centroiding", False),
             eps_space=ext.get("eps_space", 2),
             eps_time_ns=ext.get("eps_time_ns", 100.0),
@@ -474,19 +483,19 @@ class TPX3PipelineV3:
     # Pipeline lifecycle
     # =========================================================================
 
-    def _on_event_batch(self, _event, t_trigger, x, y, tof, tot):
+    def _on_event_batch(self, _event, t_trigger, x, y, tof, tot, t_sent):
         """Forward event batches to user callback if registered."""
         if self._user_event_callback:
             try:
-                self._user_event_callback(t_trigger, x, y, tof, tot)
+                self._user_event_callback(t_trigger, x, y, tof, tot, t_sent)
             except Exception as e:
                 self.logger.error(f"Event callback error: {e}")
 
-    def _on_pixel_batch(self, _event, x, y, toa, tot):
+    def _on_pixel_batch(self, _event, x, y, toa, tot, t_sent):
         """Forward pixel batches to user callback if registered."""
         if self._user_pixel_callback:
             try:
-                self._user_pixel_callback(x, y, toa, tot)
+                self._user_pixel_callback(x, y, toa, tot, t_sent)
             except Exception as e:
                 self.logger.error(f"Pixel callback error: {e}")
 
@@ -500,6 +509,15 @@ class TPX3PipelineV3:
         import queue as _queue
 
         _prev_mode = -1  # sentinel — forces initial drain on first iteration
+
+        # Periodic timing summary (DEBUG): how much of this thread's time goes to
+        # blocking on the queue (get) vs CPU work (publish -> user callback,
+        # which does np.concatenate + Qt signal emit and holds the GIL).
+        _n = 0
+        _get_time = 0.0
+        _get_cpu_time = 0.0
+        _publish_time = 0.0
+        _last_log = time.monotonic()
 
         while not self._callback_stop_event.is_set():
             flag = self._callback_display_flag
@@ -524,26 +542,59 @@ class TPX3PipelineV3:
                 continue
 
             try:
+                t0 = time.perf_counter()
+                c0 = time.thread_time()
                 data = active_q.get(timeout=0.05)
+                t1 = time.perf_counter()
+                c1 = time.thread_time()
                 if data is None:
                     continue
                 if mode == 0:
-                    t_trigger, x, y, tof, tot = data
-                    self.event_bus.publish(Events.EVENT_BATCH, t_trigger, x, y, tof, tot)
+                    t_trigger, x, y, tof, tot, t_sent = data
+                    self.event_bus.publish(Events.EVENT_BATCH, t_trigger, x, y, tof, tot, t_sent)
                 else:
-                    x, y, toa, tot = data
-                    self.event_bus.publish(Events.PIXEL_BATCH, x, y, toa, tot)
+                    x, y, toa, tot, t_sent = data
+                    self.event_bus.publish(Events.PIXEL_BATCH, x, y, toa, tot, t_sent)
+                t2 = time.perf_counter()
+
+                _n += 1
+                _get_time += (t1 - t0)
+                _get_cpu_time += (c1 - c0)
+                _publish_time += (t2 - t1)
+                now = time.monotonic()
+                if now - _last_log >= 2.0:
+                    try:
+                        qsize = active_q.qsize()
+                    except Exception:
+                        qsize = -1
+                    self.logger.debug(
+                        f"callback consumer: {_n} items/{now - _last_log:.2f}s, "
+                        f"get wall={_get_time*1000:.1f} ms (cpu={_get_cpu_time*1000:.1f} ms), "
+                        f"publish={_publish_time*1000:.1f} ms, queue={qsize}")
+                    _n = 0
+                    _get_time = 0.0
+                    _get_cpu_time = 0.0
+                    _publish_time = 0.0
+                    _last_log = now
             except _queue.Empty:
                 pass
             except Exception as e:
                 self.logger.error(f"Callback consumer error: {e}")
 
     def set_event_callback(self, callback):
-        """Set callback for receiving event batches: callback(t_trigger, x, y, tof, tot)"""
+        """Set callback for receiving event batches: callback(t_trigger, x, y, tof, tot, t_sent)
+
+        ``t_sent`` is the ``time.monotonic()`` value recorded by the extractor worker
+        when the batch was queued, for end-to-end latency measurement.
+        """
         self._user_event_callback = callback
 
     def set_pixel_callback(self, callback):
-        """Set callback for receiving pixel batches: callback(x, y, toa, tot)"""
+        """Set callback for receiving pixel batches: callback(x, y, toa, tot, t_sent)
+
+        ``t_sent`` is the ``time.monotonic()`` value recorded by the extractor worker
+        when the batch was queued, for end-to-end latency measurement.
+        """
         self._user_pixel_callback = callback
 
     def set_status_callback(self, callback):
@@ -562,10 +613,50 @@ class TPX3PipelineV3:
         if self._callback_display_flag is not None:
             self._callback_display_flag.value = 0 if mode == 'events' else 1
 
+    def set_callback_display_fraction(self, fraction: float):
+        """Set the fraction of pixels/events forwarded to the GUI callback queues.
+
+        Workers stride-subsample each chunk to roughly ``fraction`` of its
+        original size before queuing it for the GUI, shrinking the
+        multiprocessing.Queue IPC payload proportionally. Saved data is
+        always full-resolution and unaffected. Live-updatable without
+        restarting the pipeline.
+
+        Parameters
+        ----------
+        fraction : float
+            Value in (0, 1]. 1.0 = no subsampling.
+        """
+        if self._callback_display_fraction is not None:
+            self._callback_display_fraction.value = max(0.01, min(1.0, fraction))
+
     @property
     def is_connected(self):
         """Check if TCP connection is active."""
         return self.receiver.is_connected
+
+    def get_extraction_backlog(self) -> int:
+        """Estimate chunks queued in ZMQ awaiting extraction (sent - pulled by workers)."""
+        chunks_sent = self.stats.get_stats().get('chunks_sent', 0)
+        return max(0, chunks_sent - self.extractors.get_total_processed())
+
+    def get_callback_queue_size(self):
+        """Return (size, maxsize) of the active GUI callback queue, or None if disabled.
+
+        This is the multiprocessing.Queue between extractor workers and the
+        ``_callback_consumer_loop`` thread. A growing size here (while the
+        extraction backlog stays low) means the consumer/GUI side can't keep
+        up draining batches — a common source of increasing display latency.
+        """
+        flag = self._callback_display_flag
+        mode = flag.value if flag is not None else 0
+        cb_queue = self.callback_event_queue if mode == 0 else self.callback_pixel_queue
+        if cb_queue is None:
+            return None
+        try:
+            return (cb_queue.qsize(), cb_queue._maxsize)
+        except Exception:
+            return (0, 0)
 
     def start(
         self,

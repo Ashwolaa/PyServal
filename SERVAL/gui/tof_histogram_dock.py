@@ -66,8 +66,10 @@ class TofHistogramDock(Dock):
         {'title': 'Display % (throttle)', 'name': 'display_fraction', 'type': 'float',
          'value': 100.0, 'limits': (1.0, 100.0), 'step': 5.0, 'decimals': 0,
          'tip': ('Percentage of incoming events/pixels fed to the live display. '
-                 'Reduce below 100 % to keep the GUI responsive at high data rates. '
-                 'Saving to disk is always unaffected.')},
+                 'Subsampling happens in the extractor workers, before the data '
+                 'is sent to the GUI, so reducing this also shrinks the '
+                 'inter-process transfer cost (lowers display lag at high rates). '
+                 'Saving to disk is always full-resolution and unaffected.')},
     ]
 
     def __init__(self, parent=None):

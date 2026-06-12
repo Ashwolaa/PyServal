@@ -290,6 +290,13 @@ class TCPReceiver:
         else:
             data_flushed = data[:last_chunk_index]
             data_unflushed = data[last_chunk_index:]
+
+            # Nothing complete to flush yet (e.g. the only "TPX3" marker found is at
+            # offset 0). An empty payload sent to ZMQ is indistinguishable from the
+            # worker shutdown signal (zmq_socket.send(b"")), so skip sending entirely.
+            if not data_flushed:
+                return data_unflushed
+
             # Send to save queue (round-robin if multiple), gated by recording_flag
             if self.save_queues and (self.recording_flag is None or self.recording_flag.value):
                 current_queue = self.save_queues[self.save_queue_index]

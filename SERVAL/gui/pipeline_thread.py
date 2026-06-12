@@ -28,10 +28,12 @@ class PipelineThread(QThread):
 
     Signals
     -------
-    event_data_ready : Signal(object, object, object, object, object)
-        Emitted when events are available: (event_num, x, y, tof, tot)
-    pixel_data_ready : Signal(object, object, object, object)
-        Emitted when raw pixels are available: (x, y, toa, tot)
+    event_data_ready : Signal(object, object, object, object, object, float)
+        Emitted when events are available: (event_num, x, y, tof, tot, t_sent)
+        ``t_sent`` is the monotonic timestamp of the oldest batch in the
+        coalesced group, for end-to-end latency measurement.
+    pixel_data_ready : Signal(object, object, object, object, float)
+        Emitted when raw pixels are available: (x, y, toa, tot, t_sent)
     stats_updated : Signal(dict)
         Emitted with throughput statistics
     status_changed : Signal(dict)
@@ -44,8 +46,8 @@ class PipelineThread(QThread):
         Emitted when pipeline stops
     """
 
-    event_data_ready = Signal(object, object, object, object, object)
-    pixel_data_ready = Signal(object, object, object, object)
+    event_data_ready = Signal(object, object, object, object, object, float)
+    pixel_data_ready = Signal(object, object, object, object, float)
     stats_updated = Signal(dict)
     status_changed = Signal(dict)
     error_occurred = Signal(str)
@@ -151,38 +153,40 @@ class PipelineThread(QThread):
             self._pipeline = None
             self.pipeline_stopped.emit()
 
-    def _on_events(self, event_num, x, y, tof, tot):
+    def _on_events(self, event_num, x, y, tof, tot, t_sent):
         """Accumulate event batch; emit coalesced signal at most every _EMIT_INTERVAL s."""
-        self._event_acc.append((event_num, x, y, tof, tot))
+        self._event_acc.append((event_num, x, y, tof, tot, t_sent))
         now = time.monotonic()
         if now - self._last_event_emit >= _EMIT_INTERVAL:
             self._last_event_emit = now
             if len(self._event_acc) == 1:
-                en, x_, y_, tof_, tot_ = self._event_acc[0]
+                en, x_, y_, tof_, tot_, t_oldest = self._event_acc[0]
             else:
                 en   = np.concatenate([b[0] for b in self._event_acc])
                 x_   = np.concatenate([b[1] for b in self._event_acc])
                 y_   = np.concatenate([b[2] for b in self._event_acc])
                 tof_ = np.concatenate([b[3] for b in self._event_acc])
                 tot_ = np.concatenate([b[4] for b in self._event_acc])
+                t_oldest = min(b[5] for b in self._event_acc)
             self._event_acc.clear()
-            self.event_data_ready.emit(en, x_, y_, tof_, tot_)
+            self.event_data_ready.emit(en, x_, y_, tof_, tot_, t_oldest)
 
-    def _on_pixels(self, x, y, toa, tot):
+    def _on_pixels(self, x, y, toa, tot, t_sent):
         """Accumulate pixel batch; emit coalesced signal at most every _EMIT_INTERVAL s."""
-        self._pixel_acc.append((x, y, toa, tot))
+        self._pixel_acc.append((x, y, toa, tot, t_sent))
         now = time.monotonic()
         if now - self._last_pixel_emit >= _EMIT_INTERVAL:
             self._last_pixel_emit = now
             if len(self._pixel_acc) == 1:
-                x_, y_, toa_, tot_ = self._pixel_acc[0]
+                x_, y_, toa_, tot_, t_oldest = self._pixel_acc[0]
             else:
                 x_   = np.concatenate([b[0] for b in self._pixel_acc])
                 y_   = np.concatenate([b[1] for b in self._pixel_acc])
                 toa_ = np.concatenate([b[2] for b in self._pixel_acc])
                 tot_ = np.concatenate([b[3] for b in self._pixel_acc])
+                t_oldest = min(b[4] for b in self._pixel_acc)
             self._pixel_acc.clear()
-            self.pixel_data_ready.emit(x_, y_, toa_, tot_)
+            self.pixel_data_ready.emit(x_, y_, toa_, tot_, t_oldest)
 
     def _on_status(self, status_dict):
         """Callback for status updates - emits Qt signal."""
@@ -201,6 +205,16 @@ class PipelineThread(QThread):
             pipeline.set_callback_display_mode(mode)
         self._event_acc.clear()
         self._pixel_acc.clear()
+
+    def set_display_fraction(self, fraction: float):
+        """Set the fraction (0-1] of pixels/events forwarded to the GUI.
+
+        Forwards to the pipeline's shared value so workers immediately start
+        subsampling chunks before queuing them for the GUI callback.
+        """
+        pipeline = self._pipeline
+        if pipeline is not None:
+            pipeline.set_callback_display_fraction(fraction)
 
     def start_record(self, filename, save_raw=True, save_events=True,
                      save_pixels=False, save_triggers=True):
@@ -233,7 +247,7 @@ class PipelineThread(QThread):
         Returns
         -------
         dict or None
-            ``{'queues': {type: [(size, maxsize), ...]}, 'workers': [(name, alive), ...]}``
+            ``{'queues': {type: [(size, maxsize), ...]}, 'workers': [(name, alive, pid, exitcode), ...]}``
             or *None* when the pipeline is not running.
         """
         pipeline = self._pipeline  # atomic attribute read
@@ -254,7 +268,20 @@ class PipelineThread(QThread):
             workers = []
             if pipeline.extractors and pipeline.extractors.workers:
                 for w in pipeline.extractors.workers:
-                    workers.append((w.name, w.is_alive()))
+                    workers.append((w.name, w.is_alive(), w.pid, w.exitcode))
+
+            # Extraction backlog: chunks sent to ZMQ but not yet pulled by any worker.
+            # Capacity is a rough upper bound (HWM per worker socket).
+            ext = pipeline.extract_config
+            capacity = ext.get('zmq_hwm', 1000) * max(1, ext.get('num_workers', 1))
+            queues['extract'] = [(pipeline.get_extraction_backlog(), capacity)]
+
+            # GUI callback queue: batches waiting for the consumer thread / GUI to
+            # process. Growing here (while 'extract' stays low) means the GUI side
+            # is the bottleneck.
+            cb = pipeline.get_callback_queue_size()
+            if cb is not None:
+                queues['callback'] = [cb]
 
             return {'queues': queues, 'workers': workers}
         except Exception:

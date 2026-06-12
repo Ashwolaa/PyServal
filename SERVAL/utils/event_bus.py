@@ -152,8 +152,8 @@ class Events:
     CHUNK_DROPPED_ZMQ = 'chunk_dropped_zmq'    # ()
 
     # Event processing
-    EVENT_BATCH = 'event_batch'                # (event_num, x, y, tof, tot)
-    PIXEL_BATCH = 'pixel_batch'                # (x, y, toa, tot)
+    EVENT_BATCH = 'event_batch'                # (event_num, x, y, tof, tot, t_sent)
+    PIXEL_BATCH = 'pixel_batch'                # (x, y, toa, tot, t_sent)
     EVENTS_SAVED = 'events_saved'              # (count: int)
     PIXELS_SAVED = 'pixels_saved'              # (count: int)
 

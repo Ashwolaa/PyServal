@@ -62,10 +62,13 @@ from SERVAL.gui.roi_manager import ROIManager
 from SERVAL.gui.tof_histogram_dock import TofHistogramDock
 from SERVAL.utils.logging import (
     add_log_handler, get_logger, remove_log_handler,
-    enable_file_logging, disable_file_logging,
+    enable_file_logging, disable_file_logging,set_log_level
 )
 
-
+# Log a per-step timing breakdown of _update_histograms() when the total
+# exceeds this many milliseconds. Visible at DEBUG level (set_log_level('DEBUG')).
+_SLOW_REFRESH_MS = 20.0
+set_log_level('DEBUG')
 class _ServalSignaller(QObject):
     """Helper QObject for cross-thread signal delivery from the SERVAL config thread."""
     started = Signal()
@@ -125,11 +128,18 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             ]},
             {'title': 'Triggers', 'name': 'trigger_settings', 'type': 'action_led', 'children': [
                 {'title': 'Trigger Mode', 'name': 'trigger_mode', 'type': 'list',
-                 'limits': ['CONTINUOUS', 'AUTOTRIGSTART_TIMERSTOP', 'EXTERNAL'],
+                 'limits': ['CONTINUOUS', 'AUTOTRIGSTART_TIMERSTOP', 'EXTERNAL'
+                 'PEXSTART_NEXSTOP', 'NEXSTART_PEXSTOP', 'PEXSTART_TIMERSTOP', 'NEXSTART_TIMERSTOP',
+                 ],
                  'value': 'CONTINUOUS',
                  'tip': ('CONTINUOUS: free-running, no trigger correlation.\n'
                          'AUTOTRIGSTART_TIMERSTOP: internal timer generates triggers at Period/Exposure.\n'
-                         'EXTERNAL: triggers come from the TDC input (hardware signal required).')},
+                         'EXTERNAL: triggers come from the TDC input (hardware signal required).\n'
+                         'PEXSTART_NEXSTOP: Acq. is started by positive edge external trigger input, stopped by negative edge.\n'
+                         'NEXSTART_PEXSTOP: Acq. is started by negative edge external trigger input, stopped by positive edge.\n'
+                         'PEXSTART_TIMERSTOP: Acq. is started by positive edge external trigger input, stopped by HW timer.\n'
+                         'NEXSTART_TIMERSTOP: Acq. is started by negative edge external trigger input, stopped by HW timer.\n'
+                         )},
                 {'title': 'N Triggers', 'name': 'n_triggers', 'type': 'int', 'value': -1,
                  'limits': (-1, 1000000), 'tip': 'Number of triggers before auto-stop. -1 = unlimited.'},
                 {'title': 'Period (s)', 'name': 'trigger_period', 'type': 'float',
@@ -239,11 +249,12 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.pipeline_thread = None
 
         self._gui_logger = get_logger('SERVAL.GUI')
-
+        # self._gui_logger.setLevel("DEBUG")
         # State
         self.is_acquiring = False
         self._is_recording = False
         self._display_mode = 'events'   # 'events' (TOF) | 'pixels' (TOA)
+        self._lag_ms = None  # end-to-end latency (extraction -> GUI), updated per batch
 
         # Cross-thread signal helper
         self._serval_sig = _ServalSignaller()
@@ -563,6 +574,9 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 self._on_colormap_changed(param.value())
             elif name in ('tof_bins', 'tof_min_ns', 'tof_max_ns'):
                 self._on_tof_config_changed()
+            elif name == 'display_fraction':
+                if self.pipeline_thread is not None:
+                    self.pipeline_thread.set_display_fraction(param.value() / 100.0)
 
     def _on_clear_all(self):
         self.histogram.clear()
@@ -732,12 +746,16 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.histogram.clear_timeseries()
 
         callback_mode = self.settings.child('pipeline', 'live', 'callback_mode').value()
+        display_fraction = self.display.child('display_fraction').value() / 100.0
 
         self.pipeline_thread = PipelineThread(
             connection_config=self._build_connection_config(),
             save_config=self._build_save_config(),
             extract_config=self._build_extract_config(),
-            callback_config={'mode': callback_mode if callback_mode != 'disabled' else None},
+            callback_config={
+                'mode': callback_mode if callback_mode != 'disabled' else None,
+                'display_fraction': display_fraction,
+            },
             command_config=self._build_command_config(),
         )
         self.pipeline_thread.event_data_ready.connect(self._on_event_data)
@@ -905,6 +923,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self._set_pipeline_controls_enabled(True)
         self.refresh_timer.stop()
         self._last_clear_time = None
+        self._lag_ms = None
         self._log("Acquisition stopped")
         self._update_histograms()
 
@@ -929,28 +948,24 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     # =========================================================================
     # Data Handlers
     # =========================================================================
-    def _subsample(self, *arrays):
-        frac = self.display.child('display_fraction').value() / 100.0
-        if frac >= 1.0 or len(arrays[0]) == 0:
-            return arrays
-        stride = max(1, int(round(1.0 / frac)))
-        return tuple(a[::stride] for a in arrays)
-
-    def _on_event_data(self, event_num, x, y, tof, tot):
+    def _on_event_data(self, event_num, x, y, tof, tot, t_sent):
         if self._display_mode != 'events':
             return
-        event_num, x, y, tof, tot = self._subsample(event_num, x, y, tof, tot)
+        self._lag_ms = (time.monotonic() - t_sent) * 1000
         self.histogram.add_events(event_num, x, y, tof, tot)
 
-    def _on_pixel_data(self, x, y, toa, tot):
+    def _on_pixel_data(self, x, y, toa, tot, t_sent):
         if self._display_mode != 'pixels':
             return
-        x, y, toa, tot = self._subsample(x, y, toa, tot)
+        self._lag_ms = (time.monotonic() - t_sent) * 1000
         self.histogram.add_pixels(x, y, toa, tot)
 
     def _update_histograms(self):
+        t_start = time.perf_counter()
+
         if self.is_acquiring:
             self.histogram.sample_timeseries()
+        t_timeseries = time.perf_counter()
 
         pixel_data   = self.histogram.get_pixel_image()
         total_counts = int(pixel_data.sum())
@@ -959,17 +974,22 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         if self.total_dock.is_timeseries_visible():
             times, counts = self.histogram.get_timeseries(None)
             self.total_dock.update_timeseries(times, counts)
+        t_image = time.perf_counter()
 
         self.roi_manager.update_displays(self.histogram, total_counts)
+        t_roi = time.perf_counter()
 
         tof_centers, tof_counts = self.histogram.get_tof_histogram()
         self.tof_dock.update_tof(tof_centers, tof_counts)
+        t_tof = time.perf_counter()
 
         stats = self.histogram.get_stats()
+        lag_str = f"{self._lag_ms:.0f} ms" if self._lag_ms is not None else "—"
         self.stats_label.setText(
-            f"Events: {stats['total_events']:,} | Total: {stats['pixel_sum']:,}")
+            f"Events: {stats['total_events']:,} | Total: {stats['pixel_sum']:,} | Lag: {lag_str}")
 
         self._update_pipeline_status()
+        t_status = time.perf_counter()
 
         if self.is_acquiring and self._last_clear_time is not None:
             clear_interval = self.display.child('clear_interval').value()
@@ -977,6 +997,16 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 self.histogram.clear()
                 self._last_clear_time = time.time()
                 self._log("Histograms cleared")
+
+        total_ms = (t_status - t_start) * 1000
+        if total_ms > _SLOW_REFRESH_MS:
+            self._gui_logger.debug(
+                f"_update_histograms: {total_ms:.1f} ms total "
+                f"(timeseries {(t_timeseries - t_start) * 1000:.1f}, "
+                f"image {(t_image - t_timeseries) * 1000:.1f}, "
+                f"roi {(t_roi - t_image) * 1000:.1f}, "
+                f"tof {(t_tof - t_roi) * 1000:.1f}, "
+                f"status {(t_status - t_tof) * 1000:.1f})")
 
     # =========================================================================
     # Session persistence

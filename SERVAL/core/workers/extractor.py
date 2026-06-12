@@ -59,10 +59,13 @@ class ExtractorWorker(multiprocessing.Process):
         callback_trigger_queue: Optional[multiprocessing.Queue] = None,  # For GUI callbacks
         recording_flag=None,  # multiprocessing.Value('b', 0) — gates saver queue puts
         callback_display_flag=None,  # multiprocessing.Value('i') — 0=events, 1=pixels
+        callback_display_fraction=None,  # multiprocessing.Value('d', 1.0) — GUI subsample fraction
+        chunks_processed_counter=None,  # multiprocessing.Value('L', 0) — incremented per chunk
     ):
         super().__init__(name=f"Extractor-{worker_id}")
         self.worker_id = worker_id
         self.zmq_port = zmq_port
+        self.chunks_processed_counter = chunks_processed_counter
         self.event_queue = event_queue
         self.pixel_queue = pixel_queue
         self.trigger_queue = trigger_queue
@@ -79,6 +82,7 @@ class ExtractorWorker(multiprocessing.Process):
         self.write_buffer_size = write_buffer_size
         self.recording_flag = recording_flag
         self.callback_display_flag = callback_display_flag
+        self.callback_display_fraction = callback_display_fraction
         self.use_centroiding = use_centroiding
         self.eps_space = eps_space
         self.eps_time = eps_time_ns * 1e-9  # convert to seconds
@@ -93,6 +97,21 @@ class ExtractorWorker(multiprocessing.Process):
     @correlate_func.setter
     def correlate_func(self, func):
         self._correlate_func = func
+
+    def _subsample_for_display(self, arrays: tuple) -> tuple:
+        """Stride-subsample arrays for the GUI callback queue, per ``callback_display_fraction``.
+
+        Shrinks the IPC payload (and thus the multiprocessing.Queue transport
+        cost) proportionally to the "Display %" setting, instead of sending
+        the full chunk and discarding most of it client-side. Saving to disk
+        is unaffected — this only touches the GUI callback queue payload.
+        """
+        _dfrac = self.callback_display_fraction
+        frac = _dfrac.value if _dfrac is not None else 1.0
+        if frac >= 1.0 or len(arrays[0]) == 0:
+            return arrays
+        stride = max(1, round(1.0 / frac))
+        return tuple(a[::stride] for a in arrays)
 
     def run(self):
         from SERVAL.utils.logging import set_log_level
@@ -151,6 +170,10 @@ class ExtractorWorker(multiprocessing.Process):
                 total_pixels += len(pixels)
                 total_triggers += len(triggers)
 
+                if self.chunks_processed_counter is not None:
+                    with self.chunks_processed_counter.get_lock():
+                        self.chunks_processed_counter.value += 1
+
                 # Send all triggers to trigger queue (before TDC filter)
                 if len(triggers) > 0:
                     trigger_data = (triggers.toa, triggers.tdc_id, triggers.edge)
@@ -184,7 +207,10 @@ class ExtractorWorker(multiprocessing.Process):
                         _dflag is None or _dflag.value == 1
                     ):
                         try:
-                            self.callback_pixel_queue.put_nowait(pixel_data)
+                            cb_data = self._subsample_for_display(pixel_data)
+                            # Append a monotonic timestamp (callback path only) so the
+                            # GUI can measure end-to-end display latency.
+                            self.callback_pixel_queue.put_nowait(cb_data + (time.monotonic(),))
                         except Exception:
                             pass  # Drop if queue full - GUI can handle missing frames
 
@@ -238,7 +264,10 @@ class ExtractorWorker(multiprocessing.Process):
                     _dflag is None or _dflag.value == 0
                 ):
                     try:
-                        self.callback_event_queue.put_nowait(event_data)
+                        cb_data = self._subsample_for_display(event_data)
+                        # Append a monotonic timestamp (callback path only) so the
+                        # GUI can measure end-to-end display latency.
+                        self.callback_event_queue.put_nowait(cb_data + (time.monotonic(),))
                     except Exception:
                         pass  # Drop if queue full - GUI can handle missing frames
 
@@ -310,6 +339,7 @@ class ExtractorPool:
         callback_pixel_queue: Optional[multiprocessing.Queue] = None,
         recording_flag=None,  # multiprocessing.Value — gates saver queue puts
         callback_display_flag=None,  # multiprocessing.Value('i') — 0=events, 1=pixels
+        callback_display_fraction=None,  # multiprocessing.Value('d', 1.0) — GUI subsample fraction
         use_centroiding: bool = False,
         eps_space: int = 2,
         eps_time_ns: float = 100.0,
@@ -328,6 +358,7 @@ class ExtractorPool:
         self.callback_pixel_queue = callback_pixel_queue
         self.recording_flag = recording_flag
         self.callback_display_flag = callback_display_flag
+        self.callback_display_fraction = callback_display_fraction
         self.use_centroiding = use_centroiding
         self.eps_space = eps_space
         self.eps_time_ns = eps_time_ns
@@ -342,6 +373,9 @@ class ExtractorPool:
         self.zmq_context = None
         self.zmq_socket = None
         self.workers = []
+        # Per-worker shared counters of chunks pulled off the ZMQ socket —
+        # used to estimate the extraction backlog (chunks_sent - sum(counters)).
+        self.chunk_counters = [multiprocessing.Value('L', 0) for _ in range(num_workers)]
         # Saver processes/queues keyed by type ("events", "pixels", "triggers")
         self.saver_processes = {"events": [], "pixels": [], "triggers": []}
         self.saver_queues = {"events": [], "pixels": [], "triggers": []}
@@ -433,13 +467,19 @@ class ExtractorPool:
                 event_window=self.event_window,
                 recording_flag=self.recording_flag,
                 callback_display_flag=self.callback_display_flag,
+                callback_display_fraction=self.callback_display_fraction,
                 use_centroiding=self.use_centroiding,
                 eps_space=self.eps_space,
                 eps_time_ns=self.eps_time_ns,
                 b_size=self.b_size,
+                chunks_processed_counter=self.chunk_counters[i],
             )
             worker.start()
             self.workers.append(worker)
+
+    def get_total_processed(self) -> int:
+        """Total chunks pulled off the ZMQ socket by all workers (for backlog estimation)."""
+        return sum(c.value for c in self.chunk_counters)
 
     def shutdown(self, timeout: float = 5.0):
         """Shutdown all workers and savers gracefully."""

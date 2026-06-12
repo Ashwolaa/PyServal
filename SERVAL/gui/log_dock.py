@@ -65,7 +65,7 @@ class LogDock(Dock):
             'SERVAL.PixelSaverProcess',
             'SERVAL.TriggerSaverProcess',
         },
-        'GUI':        {'SERVAL.GUI'},
+        'GUI':        {'SERVAL.GUI', 'SERVAL.Histogram'},
     }
 
     _LEVEL_COLORS = {

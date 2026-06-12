@@ -56,7 +56,7 @@ class PipelineStatusDock(Dock):
         qbox_layout = QVBoxLayout(queues_box)
         qbox_layout.setSpacing(3)
         self._queue_bars = {}  # qtype -> (QProgressBar, QLabel)
-        for qtype in ('raw', 'events', 'pixels', 'triggers'):
+        for qtype in ('extract', 'callback', 'raw', 'events', 'pixels', 'triggers'):
             row = QHBoxLayout()
             name_lbl = QLabel(f"{qtype}:")
             name_lbl.setFixedWidth(56)
@@ -154,12 +154,16 @@ class PipelineStatusDock(Dock):
                 self._workers_grid.addWidget(lbl)
                 self._worker_labels.append(lbl)
 
-        for lbl, (name, alive) in zip(self._worker_labels, workers):
+        for lbl, (name, alive, pid, exitcode) in zip(self._worker_labels, workers):
             idx = name.split('-')[-1]
             color = '#4caf50' if alive else '#f44336'
             lbl.setText(f"● W{idx}")
             lbl.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 13px;")
-            lbl.setToolTip(f"{name}: {'alive' if alive else 'DEAD'}")
+            if alive:
+                lbl.setToolTip(f"{name}: alive (pid {pid})")
+            else:
+                lbl.setToolTip(f"{name}: DEAD (pid {pid}, exitcode {exitcode}) "
+                                f"— check serval.log for a traceback")
 
     def reset(self):
         """Return to idle state (no active pipeline)."""

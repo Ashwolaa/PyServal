@@ -190,6 +190,82 @@ class SERVALController(QObject):
             self.error_occurred.emit(f"Failed to get config: {e}")
             raise
 
+    def get_detector_info(self) -> dict:
+        """
+        Get the full detector info tree from SERVAL (GET /detector).
+
+        Returns everything SERVAL reports under /detector (layout, firmware,
+        chip summaries, etc.) — intended to be archived verbatim into run
+        metadata rather than parsed by the pipeline.
+
+        Returns:
+            dict: Raw JSON response, or {} if the request fails.
+        """
+        try:
+            return self._get('/detector').json()
+        except Exception as e:
+            self.error_occurred.emit(f"Failed to get detector info: {e}")
+            return {}
+
+    def get_detector_chips(self):
+        """
+        Get configuration for all detector chips.
+
+        Returns:
+            list[dict]: One dict per chip.
+        """
+        try:
+            return self._get('/detector/chips').json()
+        except Exception as e:
+            self.error_occurred.emit(f"Failed to get chip list: {e}")
+            raise
+
+    def get_chip_config(self, chip_id: int = 0) -> dict:
+        """
+        Get configuration for a single detector chip.
+
+        Parameters:
+            chip_id (int): Chip index (default 0 — the only chip in single-chip setups).
+
+        Returns:
+            dict: Chip configuration including the 'Adjust' field.
+        """
+        try:
+            return self._get(f'/detector/chips/{chip_id}').json()
+        except Exception as e:
+            self.error_occurred.emit(f"Failed to get chip {chip_id} config: {e}")
+            return {}
+
+    def get_adjusted_columns(self, chip_id: int = 0) -> list:
+        """
+        Return the list of adjusted double-column indices for the given chip.
+
+        Parses the 'Adjust' field from GET /detector/chips/<chip_id>.
+        The field is expected to be either:
+          - a 128-element list of booleans (True = column needs -25 ns correction), or
+          - a list of integer double-column indices that need correction.
+
+        Returns:
+            list[int]: Double-column indices that require the column timing correction.
+                       Empty list if the field is absent, the call fails, or no
+                       columns are marked as adjusted.
+        """
+        try:
+            chip_data = self.get_chip_config(chip_id)
+            if not chip_data:
+                return []
+            adjust = chip_data.get('Adjust', [])
+            if not adjust:
+                return []
+            # Boolean list: [True/False, ...] indexed by double-column
+            if isinstance(adjust[0], bool):
+                return [i for i, v in enumerate(adjust) if v]
+            # Already a list of integer indices
+            return [int(i) for i in adjust]
+        except Exception as e:
+            self.error_occurred.emit(f"Failed to parse adjusted columns: {e}")
+            return []
+
     def set_config(self, config_dict):
         """
         Update detector configuration
@@ -460,3 +536,4 @@ if __name__ == '__main__':
     set_log_level('DEBUG')
     ctrl = SERVALController(host='192.168.1.1', port=8080)
     print("Connected:", ctrl.connect())
+    a = ctrl.get_detector_chips()

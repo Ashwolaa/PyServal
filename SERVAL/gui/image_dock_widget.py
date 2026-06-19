@@ -9,8 +9,10 @@ from pyqtgraph.dockarea import Dock
 from qtpy.QtCore import Qt, QSize
 from qtpy.QtWidgets import (
     QAction,
+    QHBoxLayout,
     QLabel,
     QSizePolicy,
+    QSplitter,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -69,6 +71,11 @@ class ImageDockWidget(Dock):
         self.yield_label.setStyleSheet("color: gray;")
         header_tb.addWidget(self.yield_label)
 
+        self.coord_label = QLabel("")
+        self.coord_label.setStyleSheet("color: gray;")
+        self.coord_label.setMinimumWidth(150)
+        header_tb.addWidget(self.coord_label)
+
         _spacer = QWidget()
         _spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         header_tb.addWidget(_spacer)
@@ -81,8 +88,19 @@ class ImageDockWidget(Dock):
         self.image_check.setCheckable(True)
         self.image_check.setChecked(True)
         self.image_check.setToolTip("Show/hide 2D image")
-        self.image_check.toggled.connect(lambda checked: self.plot.setVisible(checked))
+        self.image_check.toggled.connect(self._on_image_toggled)
         header_tb.addAction(self.image_check)
+
+        # Lock colorbar levels (orange = unlocked/auto, green = locked)
+        self.lock_levels_check = QAction(
+            create_icon('lock', icon_color='orange', icon_checked_color='green'),
+            'Lock Levels', self
+        )
+        self.lock_levels_check.setCheckable(True)
+        self.lock_levels_check.setChecked(False)
+        self.lock_levels_check.setToolTip(
+            "Lock the colorbar levels so they don't auto-rescale on every update")
+        header_tb.addAction(self.lock_levels_check)
 
         # Time-series toggle (orange = hidden, green = visible)
         self.timeseries_check = QAction(
@@ -108,8 +126,20 @@ class ImageDockWidget(Dock):
         self.image.setColorMap(pg.colormap.get('viridis'))
         self.plot.setXRange(0, 256)
         self.plot.setYRange(0, 256)
+        self._last_data = None
+        self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
 
-        layout.addWidget(self.plot, stretch=3)
+        # Histogram LUT widget — drag the lower/upper handles to tune intensity scaling
+        self.histogram_lut = pg.HistogramLUTWidget()
+        self.histogram_lut.setImageItem(self.image)
+        self.histogram_lut.gradient.loadPreset('viridis')
+
+        self._image_container = QWidget()
+        image_row = QHBoxLayout(self._image_container)
+        image_row.setContentsMargins(0, 0, 0, 0)
+        image_row.setSpacing(2)
+        image_row.addWidget(self.plot, stretch=4)
+        image_row.addWidget(self.histogram_lut, stretch=1)
 
         # Time series plot (visible by default)
         self.timeseries_plot = pg.PlotWidget()
@@ -119,7 +149,14 @@ class ImageDockWidget(Dock):
         pen_color = color[:3] if color else (100, 100, 255)
         self.timeseries_curve = self.timeseries_plot.plot(pen=pg.mkPen(color=pen_color, width=2))
         self.timeseries_plot.setVisible(True)
-        layout.addWidget(self.timeseries_plot, stretch=1)
+
+        # Vertical splitter — drag the handle to resize the image relative to the time series plot
+        self._vsplitter = QSplitter(Qt.Orientation.Vertical)
+        self._vsplitter.addWidget(self._image_container)
+        self._vsplitter.addWidget(self.timeseries_plot)
+        self._vsplitter.setStretchFactor(0, 3)
+        self._vsplitter.setStretchFactor(1, 1)
+        layout.addWidget(self._vsplitter)
 
         self.addWidget(widget)
 
@@ -135,9 +172,27 @@ class ImageDockWidget(Dock):
     def _on_timeseries_toggled(self, checked):
         self.timeseries_plot.setVisible(checked)
 
+    def _on_image_toggled(self, checked):
+        self._image_container.setVisible(checked)
+
+    def _on_mouse_moved(self, scene_pos):
+        """Show the pixel coordinate (and value) under the mouse cursor."""
+        if not self.plot.sceneBoundingRect().contains(scene_pos):
+            self.coord_label.setText("")
+            return
+        view_pos = self.plot.getPlotItem().vb.mapSceneToView(scene_pos)
+        ix, iy = int(view_pos.x()), int(view_pos.y())
+        text = f"x={ix}, y={iy}"
+        if (self._last_data is not None
+                and 0 <= iy < self._last_data.shape[0] and 0 <= ix < self._last_data.shape[1]):
+            text += f", val={self._last_data[iy, ix]:,}"
+        self.coord_label.setText(text)
+
     def update_image(self, data):
         """Update the displayed image."""
-        self.image.setImage(data.T)
+        self._last_data = data
+        auto_levels = not self.lock_levels_check.isChecked()
+        self.image.setImage(data.T, autoLevels=auto_levels)
 
     def update_counts(self, counts, label_suffix=""):
         """Update the counts label."""
@@ -157,6 +212,7 @@ class ImageDockWidget(Dock):
         try:
             colormap = pg.colormap.get(name)
             self.image.setColorMap(colormap)
+            self.histogram_lut.gradient.loadPreset(name)
         except Exception:
             pass
 

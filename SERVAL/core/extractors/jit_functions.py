@@ -405,14 +405,14 @@ def correlate_pixels(
                 hi = mid
         event_idx = lo - 1
 
-        # Validity check
-        if event_idx < 0 or event_idx >= n_triggers - 1:
+        # Reject pixels with no preceding trigger in this chunk
+        if event_idx < 0:
             continue
 
         # Calculate ToF
         tof = toa - trigger_times[event_idx]
 
-        # Window filter
+        # Window filter (also rejects pixels that belong to the next trigger)
         if tof < event_window_min or tof > event_window_max:
             continue
 
@@ -632,9 +632,10 @@ def correlate_pixels_parallel(
         event_idx = lo - 1
         event_indices[i] = event_idx
 
-        if event_idx >= 0 and event_idx < n_triggers - 1:
+        if event_idx >= 0:
             tof = toa - trigger_times[event_idx]
             tof_values[i] = tof
+            # Window filter also rejects pixels that belong to a later trigger
             if tof >= event_window_min and tof <= event_window_max:
                 valid_mask[i] = True
 

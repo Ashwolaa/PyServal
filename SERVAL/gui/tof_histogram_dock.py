@@ -70,6 +70,20 @@ class TofHistogramDock(Dock):
                  'is sent to the GUI, so reducing this also shrinks the '
                  'inter-process transfer cost (lowers display lag at high rates). '
                  'Saving to disk is always full-resolution and unaffected.')},
+        {'title': 'Mass Calibration', 'name': 'mass_calib', 'type': 'group', 'children': [
+            {'title': 'Enable (show m/z)', 'name': 'enabled', 'type': 'bool', 'value': False,
+             'tip': 'Display the histogram in calibrated mass units instead of TOF/TOA'},
+            {'title': 'Coeff (ns / sqrt(mass))', 'name': 'coeff', 'type': 'float',
+             'value': 1.0, 'tip': 'Calibration slope: tof_ns = coeff * sqrt(mass) + t0'},
+            {'title': 't0 (ns)', 'name': 't0', 'type': 'float', 'value': 0.0,
+             'tip': 'Calibration time offset: tof_ns = coeff * sqrt(mass) + t0'},
+            {'title': 'Mass Min', 'name': 'mass_min', 'type': 'float', 'value': 0.0,
+             'tip': 'Lower bound of the mass histogram axis'},
+            {'title': 'Mass Max', 'name': 'mass_max', 'type': 'float', 'value': 200.0,
+             'tip': 'Upper bound of the mass histogram axis'},
+            {'title': 'Mass Bins', 'name': 'mass_bins', 'type': 'int', 'value': 1000,
+             'limits': (100, 10000), 'tip': 'Number of bins in the mass histogram'},
+        ]},
     ]
 
     def __init__(self, parent=None):
@@ -114,6 +128,11 @@ class TofHistogramDock(Dock):
         self._roi_table_toggle.toggled.connect(self._on_roi_table_toggled)
         toolbar.addAction(self._roi_table_toggle)
 
+        self.coord_label = QLabel("")
+        self.coord_label.setStyleSheet("color: gray;")
+        self.coord_label.setMinimumWidth(180)
+        toolbar.addWidget(self.coord_label)
+
         _spacer = QWidget()
         _spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(_spacer)
@@ -137,12 +156,13 @@ class TofHistogramDock(Dock):
             fillLevel=0,
             brush=(100, 100, 200, 100),
         )
+        self.tof_plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         layout.addWidget(self.tof_plot, stretch=3)
 
         # ── Display settings panel (hidden by default) ────────────────────────
         self.display_tree = ParameterTree()
         self.display_tree.setParameters(self.display, showTop=False)
-        self.display_tree.setMaximumHeight(180)
+        self.display_tree.setMaximumHeight(320)
         self.display_tree.setVisible(False)
         layout.addWidget(self.display_tree)
 
@@ -224,6 +244,14 @@ class TofHistogramDock(Dock):
     # -------------------------------------------------------------------------
     # Internal toggle handlers
     # -------------------------------------------------------------------------
+
+    def _on_mouse_moved(self, scene_pos):
+        """Show the cursor's (x, y) position in plot coordinates."""
+        if not self.tof_plot.sceneBoundingRect().contains(scene_pos):
+            self.coord_label.setText("")
+            return
+        view_pos = self.tof_plot.getPlotItem().vb.mapSceneToView(scene_pos)
+        self.coord_label.setText(f"x={view_pos.x():.1f}, y={view_pos.y():.0f}")
 
     def _on_display_toggled(self, checked: bool):
         self.display_tree.setVisible(checked)

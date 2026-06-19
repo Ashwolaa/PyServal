@@ -287,37 +287,36 @@ class TCPReceiver:
         last_chunk_index = find_last_pattern(data, pattern=b"TPX3")
         if last_chunk_index == -1:
             return data  # No complete chunk found, keep all data unflushed
-        else:
-            data_flushed = data[:last_chunk_index]
-            data_unflushed = data[last_chunk_index:]
 
-            # Nothing complete to flush yet (e.g. the only "TPX3" marker found is at
-            # offset 0). An empty payload sent to ZMQ is indistinguishable from the
-            # worker shutdown signal (zmq_socket.send(b"")), so skip sending entirely.
-            if not data_flushed:
-                return data_unflushed
+        data_flushed   = data[:last_chunk_index]
+        data_unflushed = data[last_chunk_index:]
 
-            # Send to save queue (round-robin if multiple), gated by recording_flag
-            if self.save_queues and (self.recording_flag is None or self.recording_flag.value):
-                current_queue = self.save_queues[self.save_queue_index]
-                self.save_queue_index = (self.save_queue_index + 1) % len(self.save_queues)
-                try:
-                    current_queue.put_nowait(data_flushed)
-                except queue.Full:
-                    self._publish(Events.CHUNK_DROPPED_SAVE)
-                    self.logger.warning("Save queue full, dropped chunk")
-
-            # Send to ZMQ
-            if self.zmq_socket:
-                try:
-                    self.zmq_socket.send(data_flushed, flags=zmq.NOBLOCK, copy=False)
-                    self._publish(Events.CHUNK_SENT, nbytes)
-                except zmq.Again:
-                    self._publish(Events.CHUNK_DROPPED_ZMQ)
-                    self.logger.warning("ZMQ send would block, dropped chunk")
-
-            # Move unflushed data to start of next buffer
+        # Nothing complete to flush yet (e.g. the only "TPX3" marker found is at
+        # offset 0). An empty payload sent to ZMQ is indistinguishable from the
+        # worker shutdown signal (zmq_socket.send(b"")), so skip sending entirely.
+        if not data_flushed:
             return data_unflushed
+
+        # Send to save queue (round-robin if multiple), gated by recording_flag
+        if self.save_queues and (self.recording_flag is None or self.recording_flag.value):
+            current_queue = self.save_queues[self.save_queue_index]
+            self.save_queue_index = (self.save_queue_index + 1) % len(self.save_queues)
+            try:
+                current_queue.put_nowait(data_flushed)
+            except queue.Full:
+                self._publish(Events.CHUNK_DROPPED_SAVE)
+                self.logger.warning("Save queue full, dropped chunk")
+
+        # Send to ZMQ
+        if self.zmq_socket:
+            try:
+                self.zmq_socket.send(data_flushed, flags=zmq.NOBLOCK, copy=False)
+                self._publish(Events.CHUNK_SENT, nbytes)
+            except zmq.Again:
+                self._publish(Events.CHUNK_DROPPED_ZMQ)
+                self.logger.warning("ZMQ send would block, dropped chunk")
+
+        return data_unflushed
 
 
 

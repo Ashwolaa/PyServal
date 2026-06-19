@@ -28,6 +28,7 @@ from SERVAL.utils import EventBus, Events
 from SERVAL.core.data_types import TDCChannel, TriggerEdge
 from SERVAL.core.tcp_receiver import TCPReceiver
 from SERVAL.core.stats_reporter import StatsReporter
+from SERVAL.core.chunk_assembler import ChunkAssembler
 from SERVAL.core.workers import ExtractorPool, RawSaverProcess
 
 
@@ -55,6 +56,10 @@ class TPX3PipelineV3:
         "num_ring_buffers": 10,
         "chunk_size": 10_000_000,
         "flush_timeout": 0.3,
+        # Trigger-aligned flushing: 0 = disabled (size/time only).
+        # When > 0, the receiver flushes every N rising edges of the selected
+        # TDC so each worker chunk is guaranteed to contain N complete shots.
+        "triggers_per_chunk": 0,
     }
 
     DEFAULT_SAVE_CONFIG = {
@@ -81,6 +86,12 @@ class TPX3PipelineV3:
         "eps_space": 2,        # pixels, Manhattan distance
         "eps_time_ns": 100.0,  # nanoseconds
         "b_size": 16,          # lookback buffer depth
+        # Per-column TOA correction from SERVAL chip config (GET /detector/chips/0).
+        # List of double-column indices that need a -25 ns adjustment.
+        # Populated by the GUI before acquisition; empty = no correction.
+        "adjusted_columns": [],
+        "chip_config": {},     # raw JSON from GET /detector/chips/0, stored in metadata
+        "detector_info": {},   # raw JSON from GET /detector, stored verbatim in metadata
     }
 
     DEFAULT_CALLBACK_CONFIG = {
@@ -125,6 +136,22 @@ class TPX3PipelineV3:
         # Logger
         self.logger = get_logger("SERVAL.Pipeline")
 
+        # Derive the raw TDC subheader byte for trigger-aligned flushing.
+        # Maps (TDCChannel, TriggerEdge) → packet subheader nibble.
+        _subheader_map = {
+            (TDCChannel.TDC1, TriggerEdge.RISING):  0xF,
+            (TDCChannel.TDC1, TriggerEdge.FALLING): 0xA,
+            (TDCChannel.TDC2, TriggerEdge.RISING):  0xE,
+            (TDCChannel.TDC2, TriggerEdge.FALLING): 0xB,
+        }
+        ext = self.extract_config
+        self._tdc_rising_subheader = _subheader_map.get(
+            (ext["tdc_id"], ext["edge"]), 0xF
+        )
+
+        # ChunkAssembler — created in _setup_components once the ZMQ socket exists
+        self._assembler: ChunkAssembler = None
+
         # Recording state (main-process only, no cross-process sharing needed)
         self._recording_flag = multiprocessing.Value('b', 0)
         self._recording_state = {
@@ -166,7 +193,7 @@ class TPX3PipelineV3:
         self.raw_saver_processes = []
         self._init_raw_savers()
 
-        # TCP Receiver
+        # TCP Receiver — transport only, no TDC knowledge
         conn = self.connection_config
         self.receiver = TCPReceiver(
             host=conn["host"],
@@ -210,6 +237,7 @@ class TPX3PipelineV3:
             eps_space=ext.get("eps_space", 2),
             eps_time_ns=ext.get("eps_time_ns", 100.0),
             b_size=ext.get("b_size", 16),
+            adjusted_columns=ext.get("adjusted_columns", []),
         )
 
         # Callbacks for events and pixels
@@ -381,6 +409,11 @@ class TPX3PipelineV3:
                 "eps_time_ns": ext.get("eps_time_ns", 100.0),
                 "b_size": ext.get("b_size", 16),
             },
+            "column_correction": {
+                "adjusted_double_columns": ext.get("adjusted_columns", []),
+                "chip_config": ext.get("chip_config", {}),
+            },
+            "detector_info": ext.get("detector_info", {}),
             "files": {
                 "events": file_map.get("events"),
                 "triggers": file_map.get("triggers"),
@@ -713,8 +746,20 @@ class TPX3PipelineV3:
         zmq_socket = self.extractors.setup_zmq()
         self.extractors.start_workers()
 
-        # Connect receiver to raw saver queues and ZMQ extractor socket
-        self.receiver.set_targets(self.raw_saver_queues, zmq_socket)
+        # ChunkAssembler sits between the receiver and ZMQ workers.
+        # It accumulates raw TPX3 chunks and forwards trigger-aligned super-chunks.
+        # In pass-through mode (triggers_per_chunk=0) it forwards immediately.
+        conn = self.connection_config
+        self._assembler = ChunkAssembler(
+            zmq_socket=zmq_socket,
+            triggers_per_chunk=conn.get("triggers_per_chunk", 0),
+            tdc_rising_subheader=self._tdc_rising_subheader,
+            flush_timeout=conn["flush_timeout"],
+            max_buffer_bytes=max(conn["chunk_size"] * 2, 20_000_000),
+        )
+
+        # Receiver → raw savers (direct) + assembler (duck-types zmq.Socket)
+        self.receiver.set_targets(self.raw_saver_queues, self._assembler)
 
         # Pass queue references to stats reporter (with declared maxsizes)
         raw_qs = self.save_config["raw"].get("queue_size", 100)
@@ -739,6 +784,7 @@ class TPX3PipelineV3:
         # Start event/pixel saver processes
         self.extractors.start_savers()
 
+        self._assembler.start()
         self.receiver.start()
         self.stats.start()
 
@@ -804,6 +850,10 @@ class TPX3PipelineV3:
 
         self.receiver.stop()
         self.receiver.close()
+
+        if self._assembler is not None:
+            self._assembler.stop()
+            self._assembler.join(timeout=2.0)
 
         self.extractors.shutdown()
 

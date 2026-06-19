@@ -48,6 +48,18 @@ class HistogramController:
         self._tof_edges = np.linspace(tof_range[0], tof_range[1], tof_bins + 1)
         self._tof_centers = (self._tof_edges[:-1] + self._tof_edges[1:]) / 2
 
+        # Mass (m/z) calibration, re-binned independently of the TOF histogram.
+        # Standard TOF-MS relation: tof_ns = coeff * sqrt(mass) + t0
+        #                       =>  mass    = ((tof_ns - t0) / coeff) ** 2
+        self._mass_calib_enabled = False
+        self._mass_coeff = 1.0
+        self._mass_t0 = 0.0
+        self._mass_bins = 1000
+        self._mass_range = (0.0, 200.0)
+        self._mass_edges = np.linspace(self._mass_range[0], self._mass_range[1], self._mass_bins + 1)
+        self._mass_centers = (self._mass_edges[:-1] + self._mass_edges[1:]) / 2
+        self._mass_counts = np.zeros(self._mass_bins, dtype=np.int64)
+
         # Multiple ROIs: name -> {"tof_min": float, "tof_max": float, "hist": np.ndarray}
         self._rois = OrderedDict()
 
@@ -55,8 +67,10 @@ class HistogramController:
         self._total_events = 0
         self._total_pixels = 0
 
-        # Trigger counting for counts/shot normalization
-        self._last_trigger_num = 0
+        # Trigger counting for counts/shot normalization.
+        # Incremented by the number of unique trigger pulses seen in each add_events() call.
+        # (event_num passed to add_events is t_trigger in seconds, not an integer index.)
+        self._n_triggers_seen = 0
 
         # Time series tracking
         self._max_timeseries_points = max_timeseries_points
@@ -66,7 +80,30 @@ class HistogramController:
 
         # Baselines for computing per-sample deltas
         self._last_sampled_pixel_count = 0
-        self._last_sampled_trigger_num = 0
+        self._last_sampled_trigger_count = 0
+
+        # Display subsampling compensation. The extractor strides pixel/event
+        # arrays before they reach the callback queue (see
+        # ExtractorWorker._subsample_for_display) to shrink IPC payload size
+        # when "Display %" < 100. Each surviving sample then represents
+        # `_display_stride` real hits, so histogram/total increments are
+        # scaled up by this factor to approximate true counts. Mirrors the
+        # extractor's own stride formula so the two stay in lockstep.
+        self._display_stride = 1
+
+    def set_display_fraction(self, frac: float):
+        """Record the current GUI display subsampling fraction (0 < frac <= 1).
+
+        Must match the fraction the extractor uses to stride callback data,
+        so that add_events/add_pixels can scale counts back up to estimate
+        true (unsampled) totals.
+        """
+        with self._lock:
+            self._display_stride = max(1, round(1.0 / frac)) if frac > 0 else 1
+
+    def _tof_ns_to_mass(self, tof_ns):
+        """Convert TOF (ns) to mass via the calibration tof_ns = coeff*sqrt(mass) + t0."""
+        return np.clip((tof_ns - self._mass_t0) / self._mass_coeff, 0.0, None) ** 2
 
     @staticmethod
     def _bincount_2d(x_clipped, y_clipped):
@@ -96,18 +133,27 @@ class HistogramController:
 
         t0 = time.perf_counter()
         with self._lock:
+            stride = self._display_stride
+
             # Clip to valid range
             x_clipped = np.clip(x.astype(np.int32), 0, 255)
             y_clipped = np.clip(y.astype(np.int32), 0, 255)
 
             # Convert TOF from seconds to nanoseconds
             tof_ns = tof * 1e9
-            # Update total pixel histogram
-            self._pixel_hist += self._bincount_2d(x_clipped, y_clipped)
+            # Update total pixel histogram (scaled to compensate for display
+            # subsampling — see _display_stride)
+            self._pixel_hist += self._bincount_2d(x_clipped, y_clipped) * stride
 
             # Update TOF histogram
             tof_hist, _ = np.histogram(tof_ns, bins=self._tof_edges)
-            self._tof_counts += tof_hist.astype(np.int64)
+            self._tof_counts += tof_hist.astype(np.int64) * stride
+
+            # Update mass (m/z) histogram, re-binned on its own mass-uniform grid
+            if self._mass_calib_enabled:
+                mass = self._tof_ns_to_mass(tof_ns)
+                mass_hist, _ = np.histogram(mass, bins=self._mass_edges)
+                self._mass_counts += mass_hist.astype(np.int64) * stride
 
             # Update all ROI histograms
             for _roi_name, roi_data in self._rois.items():
@@ -116,15 +162,20 @@ class HistogramController:
                 roi_mask = (tof_ns >= tof_min) & (tof_ns <= tof_max)
                 if np.any(roi_mask):
                     roi_data["hist"] += self._bincount_2d(
-                        x_clipped[roi_mask], y_clipped[roi_mask])
+                        x_clipped[roi_mask], y_clipped[roi_mask]) * stride
 
 
-            # Update trigger counter (event_num is the laser-shot / trigger index)
+            # Count unique trigger pulses in this batch.
+            # event_num holds t_trigger — the absolute trigger TIME in seconds (float64),
+            # one entry per correlated pixel hit.  Unique values = distinct laser shots.
+            # Not scaled by stride: a subsampled shot with fewer hits than the
+            # stride could vanish from the batch entirely, so a flat multiply
+            # would overstate the shot count rather than correct it.
             if len(event_num) > 0:
-                self._last_trigger_num = max(self._last_trigger_num, int(event_num.max()))
+                self._n_triggers_seen += len(np.unique(event_num))
 
             # Update stats
-            self._total_events += len(x)
+            self._total_events += len(x) * stride
 
         dt_ms = (time.perf_counter() - t0) * 1000
         if dt_ms > _SLOW_UPDATE_MS:
@@ -151,24 +202,31 @@ class HistogramController:
 
         t0 = time.perf_counter()
         with self._lock:
+            stride = self._display_stride
+
             x_clipped = np.clip(x.astype(np.int32), 0, 255)
             y_clipped = np.clip(y.astype(np.int32), 0, 255)
 
-            self._pixel_hist += self._bincount_2d(x_clipped, y_clipped)
+            self._pixel_hist += self._bincount_2d(x_clipped, y_clipped) * stride
 
             # Fill TOA histogram (reuses the same axis as TOF)
             toa_ns = toa * 1e9
             toa_hist, _ = np.histogram(toa_ns, bins=self._tof_edges)
-            self._tof_counts += toa_hist.astype(np.int64)
+            self._tof_counts += toa_hist.astype(np.int64) * stride
+
+            if self._mass_calib_enabled:
+                mass = self._tof_ns_to_mass(toa_ns)
+                mass_hist, _ = np.histogram(mass, bins=self._mass_edges)
+                self._mass_counts += mass_hist.astype(np.int64) * stride
 
             # Update ROI histograms filtered by TOA range
             for _roi_name, roi_data in self._rois.items():
                 roi_mask = (toa_ns >= roi_data["tof_min"]) & (toa_ns <= roi_data["tof_max"])
                 if np.any(roi_mask):
                     roi_data["hist"] += self._bincount_2d(
-                        x_clipped[roi_mask], y_clipped[roi_mask])
+                        x_clipped[roi_mask], y_clipped[roi_mask]) * stride
 
-            self._total_pixels += len(x)
+            self._total_pixels += len(x) * stride
 
         dt_ms = (time.perf_counter() - t0) * 1000
         if dt_ms > _SLOW_UPDATE_MS:
@@ -200,6 +258,20 @@ class HistogramController:
         """
         with self._lock:
             return self._tof_centers.copy(), self._tof_counts.copy()
+
+    def get_mass_histogram(self):
+        """
+        Get current mass (m/z) histogram, re-binned via the TOF→mass calibration.
+
+        Returns
+        -------
+        bin_centers : np.ndarray
+            Center of each bin, in the calibration's mass units (e.g. Da).
+        counts : np.ndarray
+            Counts in each bin.
+        """
+        with self._lock:
+            return self._mass_centers.copy(), self._mass_counts.copy()
 
     def get_stats(self):
         """
@@ -237,15 +309,15 @@ class HistogramController:
 
             elapsed = now - self._timeseries_start
             current_pixel_count = int(self._pixel_hist.sum())
-            current_trigger_num = self._last_trigger_num
+            current_trigger_count = self._n_triggers_seen
 
             delta_counts = current_pixel_count - self._last_sampled_pixel_count
-            delta_triggers = current_trigger_num - self._last_sampled_trigger_num
+            delta_triggers = current_trigger_count - self._last_sampled_trigger_count
             # In trigger mode: counts/shot.  In pixel mode (no triggers): raw count delta.
             rate = delta_counts / delta_triggers if delta_triggers > 0 else float(delta_counts)
 
             self._last_sampled_pixel_count = current_pixel_count
-            self._last_sampled_trigger_num = current_trigger_num
+            self._last_sampled_trigger_count = current_trigger_count
 
             self._total_timeseries.append((elapsed, rate))
             if len(self._total_timeseries) > self._max_timeseries_points:
@@ -260,7 +332,7 @@ class HistogramController:
                 roi_rate = delta_roi / delta_triggers if delta_triggers > 0 else float(delta_roi)
 
                 roi_data["last_sampled_count"] = roi_counts
-                roi_data["last_sampled_trigger"] = current_trigger_num
+                roi_data["last_sampled_trigger"] = current_trigger_count
 
                 if "timeseries" not in roi_data:
                     roi_data["timeseries"] = []
@@ -313,11 +385,15 @@ class HistogramController:
         with self._lock:
             self._pixel_hist.fill(0)
             self._tof_counts.fill(0)
+            self._mass_counts.fill(0)
             self._total_events = 0
             self._total_pixels = 0
 
-            # Reset per-sample baselines so next timeseries point measures from zero
+            # Reset per-sample baselines so next timeseries point measures from zero.
+            # Trigger count is NOT reset (we keep counting shots), but the baseline is
+            # advanced to the current count so the delta restarts cleanly from zero.
             self._last_sampled_pixel_count = 0
+            self._last_sampled_trigger_count = self._n_triggers_seen
 
             # Clear ROI histograms but keep definitions
             for roi_data in self._rois.values():
@@ -346,6 +422,56 @@ class HistogramController:
             )
             self._tof_centers = (self._tof_edges[:-1] + self._tof_edges[1:]) / 2
             self._tof_counts = np.zeros(self._tof_bins, dtype=np.int64)
+
+    # =========================================================================
+    # TOF -> Mass (m/z) Calibration
+    # =========================================================================
+
+    def set_mass_calibration(self, coeff, t0, enabled=True):
+        """
+        Configure the TOF->mass calibration: tof_ns = coeff * sqrt(mass) + t0.
+
+        Parameters
+        ----------
+        coeff : float
+            Calibration slope (ns / sqrt(mass unit)).
+        t0 : float
+            Time offset (ns).
+        enabled : bool
+            Whether incoming events should also be re-binned into the mass histogram.
+        """
+        with self._lock:
+            self._mass_coeff = coeff if coeff else 1.0
+            self._mass_t0 = t0
+            self._mass_calib_enabled = enabled
+
+    def is_mass_calibration_enabled(self):
+        """Return True if the TOF->mass calibration is currently enabled."""
+        with self._lock:
+            return self._mass_calib_enabled
+
+    def set_mass_config(self, mass_range=None, mass_bins=None):
+        """
+        Update mass histogram configuration (clears mass data).
+
+        Parameters
+        ----------
+        mass_range : tuple, optional
+            (min, max) in the calibration's mass units.
+        mass_bins : int, optional
+            Number of bins.
+        """
+        with self._lock:
+            if mass_range is not None:
+                self._mass_range = mass_range
+            if mass_bins is not None:
+                self._mass_bins = mass_bins
+
+            self._mass_edges = np.linspace(
+                self._mass_range[0], self._mass_range[1], self._mass_bins + 1
+            )
+            self._mass_centers = (self._mass_edges[:-1] + self._mass_edges[1:]) / 2
+            self._mass_counts = np.zeros(self._mass_bins, dtype=np.int64)
 
     # =========================================================================
     # Multiple ROI Support

@@ -108,12 +108,18 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 {'title': 'Dest. Port', 'name': 'dest_port', 'type': 'int', 'value': 8088,
                  'limits': (1, 65535), 'tip': 'TCP port on which the pipeline listens for incoming data'},
                 {'title': 'Advanced', 'name': 'advanced', 'type': 'group', 'children': [
+                    {'title': 'Triggers / Chunk', 'name': 'triggers_per_chunk', 'type': 'int',
+                     'value': 100, 'limits': (0, 100_000),
+                     'tip': ('Flush to workers every N rising edges of the selected TDC. '
+                             'Each worker chunk is then guaranteed to contain exactly N '
+                             'complete laser shots with no cross-chunk orphaned pixels. '
+                             '0 = disabled, use chunk size / timeout only.')},
                     {'title': 'Chunk Size (B)', 'name': 'chunk_size', 'type': 'int',
                      'value': 10_000_000, 'limits': (100_000, 100_000_000),
-                     'tip': 'Flush data to extractors after this many bytes (larger = higher latency, better throughput)'},
+                     'tip': 'Fallback: flush after this many bytes when trigger-aligned flushing is disabled or not enough triggers have arrived yet'},
                     {'title': 'Flush Timeout (s)', 'name': 'flush_timeout', 'type': 'float',
                      'value': 0.3, 'limits': (0.01, 5.0),
-                     'tip': 'Force flush after this many seconds even if chunk size not reached'},
+                     'tip': 'Force flush after this many seconds even if chunk size / trigger count not reached'},
                     {'title': 'Recv Buffer (MB)', 'name': 'recv_buffer_mb', 'type': 'int',
                      'value': 2, 'limits': (1, 512),
                      'tip': 'OS-level TCP receive buffer size — increase if seeing dropped chunks at high rates'},
@@ -253,6 +259,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         # State
         self.is_acquiring = False
         self._is_recording = False
+        self._record_start_time = None  # time.monotonic() when recording started
         self._display_mode = 'events'   # 'events' (TOF) | 'pixels' (TOA)
         self._lag_ms = None  # end-to-end latency (extraction -> GUI), updated per batch
 
@@ -354,6 +361,9 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                         tip='Show/hide pipeline status panel (queues & workers)',
                         checkable=True, auto_toolbar=False,
                         icon_checked_color='green')
+        self.add_action('quit', 'Quit', 'close',
+                        tip='Close the application',
+                        auto_toolbar=False)
 
     def _setup_toolbar(self):
         self.setup_actions()
@@ -372,6 +382,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         tb.addAction(self.get_action('show_recording'))
         tb.addAction(self.get_action('show_log'))
         tb.addAction(self.get_action('show_pipeline_status'))
+        tb.addSeparator()
+        tb.addAction(self.get_action('quit'))
 
         self.get_action('run').setEnabled(False)
 
@@ -396,6 +408,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             lambda v: self.log_dock.show() if v else self.log_dock.hide())
         self.get_action('show_pipeline_status').connect_to(
             lambda v: self._status_dock.show() if v else self._status_dock.hide())
+        self.get_action('quit').connect_to(lambda: self.close())
 
     # ── Toolbar style ─────────────────────────────────────────────────────────
 
@@ -520,6 +533,11 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         tb.addWidget(self.record_btn)
 
         tb.addSeparator()
+        self.record_time_label = QLabel("")
+        self.record_time_label.setStyleSheet("font-family: monospace; color: #ff4444; font-weight: bold;")
+        tb.addWidget(self.record_time_label)
+
+        tb.addSeparator()
         self.stats_label = QLabel("Events: 0")
         self.stats_label.setStyleSheet("font-family: monospace;")
         tb.addWidget(self.stats_label)
@@ -575,8 +593,12 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             elif name in ('tof_bins', 'tof_min_ns', 'tof_max_ns'):
                 self._on_tof_config_changed()
             elif name == 'display_fraction':
+                frac = param.value() / 100.0
+                self.histogram.set_display_fraction(frac)
                 if self.pipeline_thread is not None:
-                    self.pipeline_thread.set_display_fraction(param.value() / 100.0)
+                    self.pipeline_thread.set_display_fraction(frac)
+            elif param.parent() is not None and param.parent().name() == 'mass_calib':
+                self._on_mass_calib_changed()
 
     def _on_clear_all(self):
         self.histogram.clear()
@@ -595,16 +617,36 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.histogram.set_tof_config(tof_range=(tof_min, tof_max), tof_bins=tof_bins)
         self._update_histograms()
 
+    def _on_mass_calib_changed(self):
+        calib = self.display.child('mass_calib')
+        self.histogram.set_mass_calibration(
+            calib.child('coeff').value(),
+            calib.child('t0').value(),
+            enabled=calib.child('enabled').value(),
+        )
+        self.histogram.set_mass_config(
+            mass_range=(calib.child('mass_min').value(), calib.child('mass_max').value()),
+            mass_bins=calib.child('mass_bins').value(),
+        )
+        self._apply_display_mode(self._display_mode)
+        self._update_histograms()
+
     def _apply_display_mode(self, mode: str):
         """Update plot titles and axis labels to match display mode."""
+        self._display_mode = mode
+        mass_mode = self.histogram.is_mass_calibration_enabled()
         if mode == 'pixels':
-            self.tof_dock.set_plot_title("Time of Arrival (TOA)")
-            self.tof_dock.set_x_label("TOA (ns)")
+            base_title, base_units = "Time of Arrival (TOA)", "TOA (ns)"
             ts_label = "Counts/Refresh"
         else:
-            self.tof_dock.set_plot_title("Time of Flight (TOF)")
-            self.tof_dock.set_x_label("TOF (ns)")
+            base_title, base_units = "Time of Flight (TOF)", "TOF (ns)"
             ts_label = "Counts/Shot"
+        if mass_mode:
+            self.tof_dock.set_plot_title(f"{base_title} → Mass (calibrated)")
+            self.tof_dock.set_x_label("m/z")
+        else:
+            self.tof_dock.set_plot_title(base_title)
+            self.tof_dock.set_x_label(base_units)
         self.total_dock.set_timeseries_label(ts_label)
         self.roi_manager.set_timeseries_label(ts_label)
 
@@ -686,6 +728,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         return {
             'host': s['dest_host'],
             'port': s['dest_port'],
+            'triggers_per_chunk': adv['triggers_per_chunk'],
             'chunk_size': adv['chunk_size'],
             'flush_timeout': adv['flush_timeout'],
             'recv_buffer_size': adv['recv_buffer_mb'] * 1024 * 1024,
@@ -707,6 +750,11 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             'b_size':           c['b_size'],
             'zmq_port':         adv['zmq_port'],
             'zmq_hwm':          adv['zmq_hwm'],
+            # Column correction — populated by _start_acquisition from SERVAL chip config
+            'adjusted_columns': getattr(self, '_chip_adjust_columns', []),
+            'chip_config':      getattr(self, '_chip_config', {}),
+            # Full /detector tree, archived verbatim into run metadata
+            'detector_info':    getattr(self, '_detector_info', {}),
         }
 
     def _build_save_config(self):
@@ -745,8 +793,37 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.histogram.clear()
         self.histogram.clear_timeseries()
 
+        # Fetch chip configuration for column timing correction.
+        # Done here (before workers start) so adjusted_columns is available at
+        # ExtractorWorker construction time.  A failure is non-fatal: we proceed
+        # with no correction and log a warning.
+        self._chip_config = {}
+        self._chip_adjust_columns = []
+        try:
+            chip_cfg = self.serval.get_chip_config(chip_id=0)
+            if chip_cfg:
+                self._chip_config = chip_cfg
+                self._chip_adjust_columns = self.serval.get_adjusted_columns(chip_id=0)
+                if self._chip_adjust_columns:
+                    self._log(
+                        f"Column correction: {len(self._chip_adjust_columns)} adjusted "
+                        f"double-column(s): {self._chip_adjust_columns}"
+                    )
+                else:
+                    self._log("Column correction: no adjusted double-columns reported by SERVAL")
+        except Exception as e:
+            self._log(f"Could not fetch chip config (column correction disabled): {e}", level=30)
+
+        # Fetch the full /detector info tree, archived verbatim into run metadata.
+        self._detector_info = {}
+        try:
+            self._detector_info = self.serval.get_detector_info()
+        except Exception as e:
+            self._log(f"Could not fetch detector info (metadata will omit it): {e}", level=30)
+
         callback_mode = self.settings.child('pipeline', 'live', 'callback_mode').value()
         display_fraction = self.display.child('display_fraction').value() / 100.0
+        self.histogram.set_display_fraction(display_fraction)
 
         self.pipeline_thread = PipelineThread(
             connection_config=self._build_connection_config(),
@@ -871,6 +948,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             )
             if ok:
                 self._is_recording = True
+                self._record_start_time = time.monotonic()
                 self._set_record_btn_state(True)
                 self._set_led(self.led_recording, True, color='#ff4444')
                 self.record_filename_edit.setEnabled(False)
@@ -888,6 +966,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         if self.pipeline_thread is not None:
             self.pipeline_thread.stop_record()
         self._is_recording = False
+        self._record_start_time = None
+        self.record_time_label.setText("")
         self._set_record_btn_state(False)
         self._set_led(self.led_recording, False)
         self.record_filename_edit.clear()
@@ -902,6 +982,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             self._save_timer.stop()
             self.pipeline_thread.stop_record()
             self._is_recording = False
+            self._record_start_time = None
+            self.record_time_label.setText("")
         self._log("Stopping acquisition...")
         self.serval.stop_measurement()
         if self.pipeline_thread:
@@ -912,6 +994,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self._reset_pipeline_status()
         self.is_acquiring = False
         self._is_recording = False
+        self._record_start_time = None
+        self.record_time_label.setText("")
         self._save_timer.stop()
         self.record_btn.setEnabled(False)
         self._set_record_btn_state(False)
@@ -979,7 +1063,10 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.roi_manager.update_displays(self.histogram, total_counts)
         t_roi = time.perf_counter()
 
-        tof_centers, tof_counts = self.histogram.get_tof_histogram()
+        if self.histogram.is_mass_calibration_enabled():
+            tof_centers, tof_counts = self.histogram.get_mass_histogram()
+        else:
+            tof_centers, tof_counts = self.histogram.get_tof_histogram()
         self.tof_dock.update_tof(tof_centers, tof_counts)
         t_tof = time.perf_counter()
 
@@ -987,6 +1074,12 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         lag_str = f"{self._lag_ms:.0f} ms" if self._lag_ms is not None else "—"
         self.stats_label.setText(
             f"Events: {stats['total_events']:,} | Total: {stats['pixel_sum']:,} | Lag: {lag_str}")
+
+        if self._is_recording and self._record_start_time is not None:
+            elapsed = int(time.monotonic() - self._record_start_time)
+            h, rem = divmod(elapsed, 3600)
+            m, s = divmod(rem, 60)
+            self.record_time_label.setText(f"● Rec {h:02d}:{m:02d}:{s:02d}")
 
         self._update_pipeline_status()
         t_status = time.perf_counter()
@@ -1011,6 +1104,22 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     # =========================================================================
     # Session persistence
     # =========================================================================
+    # Parameter types whose value is a persistable scalar config setting
+    # (as opposed to 'group'/'action_led' container nodes or transient
+    # action/status indicators).
+    _CONFIG_LEAF_TYPES = ('str', 'int', 'float', 'bool', 'list')
+
+    def _iter_config_params(self, parent=None):
+        """Recursively yield every leaf Parameter under *parent* (default
+        ``self.settings``) representing a user-configurable setting."""
+        if parent is None:
+            parent = self.settings
+        for child in parent.children():
+            if child.hasChildren():
+                yield from self._iter_config_params(child)
+            elif child.type() in self._CONFIG_LEAF_TYPES:
+                yield child
+
     def _qsettings(self) -> QSettings:
         return QSettings('SERVAL', 'AcquisitionGUI')
 
@@ -1036,6 +1145,15 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                     child.setValue(type(child.value())(val))
                 except Exception:
                     pass
+        # Acquisition / pipeline configuration (SERVAL connection, saving
+        # options, processing parameters, ...)
+        for child in self._iter_config_params():
+            key = 'config/' + '/'.join(self.settings.childPath(child))
+            if s.contains(key):
+                try:
+                    child.setValue(s.value(key, child.value(), type(child.value())))
+                except Exception:
+                    pass
         # Toolbar style — applied after all docks are built so every toolbar is covered
         if (saved := s.value('toolbar_style')) is not None:
             restored = Qt.ToolButtonStyle(int(saved))
@@ -1050,6 +1168,9 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         s.setValue('dockarea_state', self.dock_area.saveState())
         for child in self.display.children():
             s.setValue(f'display/{child.name()}', child.value())
+        for child in self._iter_config_params():
+            key = 'config/' + '/'.join(self.settings.childPath(child))
+            s.setValue(key, child.value())
 
     # =========================================================================
     # Window Events

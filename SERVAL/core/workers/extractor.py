@@ -61,6 +61,7 @@ class ExtractorWorker(multiprocessing.Process):
         callback_display_flag=None,  # multiprocessing.Value('i') — 0=events, 1=pixels
         callback_display_fraction=None,  # multiprocessing.Value('d', 1.0) — GUI subsample fraction
         chunks_processed_counter=None,  # multiprocessing.Value('L', 0) — incremented per chunk
+        adjusted_columns: list = None,  # double-column indices needing -25 ns TOA correction
     ):
         super().__init__(name=f"Extractor-{worker_id}")
         self.worker_id = worker_id
@@ -89,6 +90,17 @@ class ExtractorWorker(multiprocessing.Process):
         self.b_size = b_size
         self.daemon = True
         self._correlate_func = correlate_func
+
+        # Precompute a per-x-coordinate correction lookup (float64, seconds).
+        # 25 ns = 16 × 1.5625 ns = the one-clock-cycle offset for adjusted double-columns.
+        # None when no columns need correction (fast path: no array indexing at all).
+        if adjusted_columns:
+            self._toa_correction = np.zeros(256, dtype=np.float64)
+            for dcol in adjusted_columns:
+                self._toa_correction[dcol * 2]     = 25e-9
+                self._toa_correction[dcol * 2 + 1] = 25e-9
+        else:
+            self._toa_correction = None
     
     @property
     def correlate_func(self):
@@ -138,11 +150,11 @@ class ExtractorWorker(multiprocessing.Process):
         total_events = 0
         start_time = time.time()
         
-        diagnostics = {'t_extract': np.empty(self.stats_interval),
-                        't_correlate': np.empty(self.stats_interval),
-                        'pixels_per_chunk': np.empty(self.stats_interval),
-                        'triggers_per_chunk': np.empty(self.stats_interval),
-                        'valid_events': np.empty(self.stats_interval)
+        diagnostics = {'t_extract': np.zeros(self.stats_interval),
+                        't_correlate': np.zeros(self.stats_interval),
+                        'pixels_per_chunk': np.zeros(self.stats_interval),
+                        'triggers_per_chunk': np.zeros(self.stats_interval),
+                        'valid_events': np.zeros(self.stats_interval)
                         }
         try:
             while True:
@@ -165,6 +177,16 @@ class ExtractorWorker(multiprocessing.Process):
                         self.eps_space, self.eps_time, self.b_size,
                     )
                     pixels = PixelData(x=cx, y=cy, toa=ctoa, tot=ctot)
+
+                # Apply per-column TOA correction for SERVAL-reported adjusted
+                # double-columns (subtract 25 ns = one 40 MHz clock cycle).
+                if self._toa_correction is not None and len(pixels) > 0:
+                    correction = self._toa_correction[pixels.x]
+                    pixels = PixelData(
+                        x=pixels.x, y=pixels.y,
+                        toa=pixels.toa - correction,
+                        tot=pixels.tot,
+                    )
 
                 chunks_processed += 1
                 total_pixels += len(pixels)
@@ -229,7 +251,7 @@ class ExtractorWorker(multiprocessing.Process):
 
                 trigger_times = triggers.toa[mask]
 
-                if len(trigger_times) < 2:
+                if len(trigger_times) == 0:
                     continue
 
                 # JIT correlation
@@ -292,7 +314,7 @@ class ExtractorWorker(multiprocessing.Process):
                         f"[W{self.worker_id}] {pixels_per_chunk:,} px / {triggers_per_chunk:,} tr → {n_event:,} ev | "
                         f"{t_total:.1f}ms (ext:{t_extract:.1f} corr:{t_correlate:.1f})"
                     )
-                    diagnostics = {key: np.empty(self.stats_interval) for key in diagnostics.keys()}
+                    diagnostics = {key: np.zeros(self.stats_interval) for key in diagnostics.keys()}
 
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
@@ -344,6 +366,7 @@ class ExtractorPool:
         eps_space: int = 2,
         eps_time_ns: float = 100.0,
         b_size: int = 16,
+        adjusted_columns: list = None,
     ):
         self.num_workers = num_workers
         self.zmq_port = zmq_port
@@ -363,6 +386,7 @@ class ExtractorPool:
         self.eps_space = eps_space
         self.eps_time_ns = eps_time_ns
         self.b_size = b_size
+        self.adjusted_columns = adjusted_columns or []
 
         # Merge user config with defaults
         self.save_config = {
@@ -473,6 +497,7 @@ class ExtractorPool:
                 eps_time_ns=self.eps_time_ns,
                 b_size=self.b_size,
                 chunks_processed_counter=self.chunk_counters[i],
+                adjusted_columns=self.adjusted_columns,
             )
             worker.start()
             self.workers.append(worker)

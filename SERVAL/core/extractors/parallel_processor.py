@@ -33,6 +33,20 @@ from SERVAL.core.extractors.jit_functions import (
     centroid_hits as _centroid_hits,
 )
 
+# Tick size shared by the pixel ToA and TDC coarse-time counters once unwrapped
+# (1.5625 ns = 25 ns / 16, the SPIDR clock's base unit). The TDC's `tdc_extended`
+# value additionally has 6 fine-time sub-steps per tick (`* 6` in
+# _extract_triggers/extract_triggers), so its tick size is exactly _TICK_S / 6.
+# Both pixel and trigger ToA are extended from the same chunk-wide min_ts
+# anchor, which grows unbounded over an acquisition — deriving the trigger
+# factor from _TICK_S (instead of a separately hand-typed decimal literal)
+# keeps the two time axes from desyncing as that anchor grows: a tiny relative
+# error in the trigger factor was previously showing up as a TOF drift that
+# grew linearly with total acquisition time (the anchor value), not just the
+# (much smaller) DeltaT within the event window.
+_TICK_S = 1.5625e-9
+_TDC_TICK_S = _TICK_S / 6
+
 # Re-export for backwards compatibility
 __all__ = [
     'TPX3Extractor',
@@ -134,7 +148,7 @@ class TPX3Extractor:
             pixels = PixelData(
                 x=x,
                 y=y,
-                toa=toa.astype(np.float64) * 1.5625e-9,
+                toa=toa.astype(np.float64) * _TICK_S,
                 tot=tot,
             )
         t_pixels = time.perf_counter()
@@ -147,7 +161,7 @@ class TPX3Extractor:
             tdc_min_ts = all_min_ts[is_tdc]
             toa, tdc_id, edge = extract_triggers(tdc_packets, tdc_subheaders, tdc_min_ts)
             triggers = TriggerData(
-                toa=toa.astype(np.float64) * 260.41666e-12,
+                toa=toa.astype(np.float64) * _TDC_TICK_S,
                 tdc_id=tdc_id,
                 edge=edge,
             )
@@ -291,7 +305,7 @@ class TPX3Extractor:
 
         toa = ((((spidr_time << 14) + toa_coarse) << 4) - ftoa)
         toa = self._extend_timestamp(toa, min_timestamp, n_bits=34)
-        toa = toa.astype(np.float64) * 1.5625e-9
+        toa = toa.astype(np.float64) * _TICK_S
 
         return PixelData(x=x, y=y, toa=toa, tot=tot)
 
@@ -306,7 +320,7 @@ class TPX3Extractor:
         tmp_fine = ((tdc_packets >> 5) & 0xF).astype(np.uint64)
 
         tdc_extended = self._extend_timestamp(coarse_time, min_timestamp, n_bits=36)
-        tdc_time = (tdc_extended * 6 + tmp_fine - 1).astype(np.float64) * 260.41666e-12
+        tdc_time = (tdc_extended * 6 + tmp_fine - 1).astype(np.float64) * _TDC_TICK_S
 
         tdc_id = np.zeros(len(tdc_packets), dtype=np.uint8)
         edge = np.zeros(len(tdc_packets), dtype=np.uint8)

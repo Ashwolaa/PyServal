@@ -102,6 +102,9 @@ class TestCommandServer:
                 save_raw=True,
                 save_events=True,
                 save_pixels=False,
+                flat=False,
+                write_metadata=True,
+                metadata_name=None,
             )
         finally:
             s.stop()

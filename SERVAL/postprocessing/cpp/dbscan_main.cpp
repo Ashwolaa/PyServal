@@ -8,6 +8,7 @@
 #include <iomanip> //for setprecision
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 
 
 //struct for a point
@@ -15,7 +16,6 @@ struct Point {
     double shot; //shot id
     double x;
     double y;
-    double z; //tof transformed to z coordinate
     double tof;
     double tot;
     double label; // Cluster label
@@ -75,55 +75,77 @@ double interpolate(const std::vector<double>& xVals, const std::vector<double>& 
 }
 
 
-// Calculate Euclidean distance between two points
+// Spatial (x, y) Euclidean distance between two points, in pixels.
 double calculateDistance(const Point& p1, const Point& p2) {
     return sqrt((p1.x - p2.x) * (p1.x - p2.x) +
-                (p1.y - p2.y) * (p1.y - p2.y) +
-                (p1.z - p2.z) * (p1.z - p2.z));
+                (p1.y - p2.y) * (p1.y - p2.y));
 }
 
-// Find neighboring points within the epsilon distance
-std::vector<int> findNeighbors(const std::vector<Point>& points, int pointIndex, double epsilon) {
+// Two points belong to the same cluster only if they are BOTH spatially close
+// (<= epsilon pixels apart) AND close in ToF (<= epsTime seconds apart). These
+// are independent, separately-tunable criteria: epsilon controls how large a
+// single ion hit's pixel footprint can be; epsTime controls how far apart in
+// ToF two pixel hits can be and still be considered the same ion (as opposed
+// to two distinct ions/masses arriving at different times on the same shot).
+std::vector<int> findNeighbors(const std::vector<Point>& points, int pointIndex, double epsilon, double epsTime) {
     std::vector<int> neighbors;
+    const Point& p0 = points[pointIndex];
     for (int i = 0; i < points.size(); ++i) {
         if (i == pointIndex) continue;
-        double distance = calculateDistance(points[pointIndex], points[i]);
-        if (distance <= epsilon) {
+        if (std::fabs(p0.tof - points[i].tof) > epsTime) continue;
+        if (calculateDistance(p0, points[i]) <= epsilon) {
             neighbors.push_back(i);
         }
     }
     return neighbors;
 }
 
-// Expand a cluster starting from a seed point
-void expandCluster(std::vector<Point>& points, int pointIndex, int cluster, double epsilon, int minPoints) {
-    std::vector<int> seeds = findNeighbors(points, pointIndex, epsilon);
-    if (seeds.size() < minPoints) {
-        points[pointIndex].label = -1; // Mark as noise. Should already be marked by default, but just to be safe.
-        return;
-    }
-    points[pointIndex].label = cluster;
-    points[pointIndex].visited = true;
+// Expand a cluster outward (breadth-first) from a core seed point.
+// Core points (>= minPoints neighbors) pull their neighbors into the cluster
+// and keep expanding; border points (reached as someone else's neighbor but
+// not core themselves) join the cluster without expanding further.
+void expandCluster(std::vector<Point>& points, int startIndex, int cluster, double epsilon, double epsTime, int minPoints) {
+    std::vector<int> queue;
+    queue.push_back(startIndex);
+    points[startIndex].visited = true;
+    points[startIndex].label = cluster;
 
-    
-    for (int i = 0; i < seeds.size(); ++i) {
-        int seedIndex = seeds[i];
-        if (!points[seedIndex].visited) {
-            expandCluster(points, seedIndex, cluster, epsilon, minPoints);
+    for (size_t qi = 0; qi < queue.size(); ++qi) {
+        int current = queue[qi];
+        std::vector<int> neighbors = findNeighbors(points, current, epsilon, epsTime);
+        if ((int)neighbors.size() < minPoints) {
+            continue; // border point: joined the cluster, but does not expand it
+        }
+        for (int n : neighbors) {
+            if (!points[n].visited) {
+                points[n].visited = true;
+                points[n].label = cluster;
+                queue.push_back(n);
+            } else if (points[n].label == -1) {
+                // Previously visited and provisionally marked noise (it wasn't
+                // itself a core point at the time), but it is density-reachable
+                // from this core point, so it belongs in the cluster as a border point.
+                points[n].label = cluster;
+            }
         }
     }
 }
 
 
 //dbscan algorithm
-void dbscan(std::vector<Point>& points, double epsilon, int minPoints, int& cluster) {
+void dbscan(std::vector<Point>& points, double epsilon, double epsTime, int minPoints, int& cluster) {
     for (int i = 0; i < points.size(); ++i) {
-        if (!points[i].visited) {
-            expandCluster(points, i, cluster, epsilon, minPoints);
-            if (points[i].label != -1) {
-                cluster++;
-            }
+        if (points[i].visited) continue;
+
+        std::vector<int> neighbors = findNeighbors(points, i, epsilon, epsTime);
+        if ((int)neighbors.size() < minPoints) {
+            points[i].visited = true;
+            points[i].label = -1; // noise for now; may be reclaimed as a border point later
+            continue;
         }
+
+        expandCluster(points, i, cluster, epsilon, epsTime, minPoints);
+        cluster++;
     }
 }
 
@@ -136,18 +158,31 @@ void dbscan(std::vector<Point>& points, double epsilon, int minPoints, int& clus
 // Main function
 int main(int argc, char* argv[]) {
     // Parse optional named arguments first
-    double EPSILON = 2.0;       // Epsilon neighborhood distance threshold
+    double EPSILON = 2.0;       // Spatial (x, y) neighborhood radius, pixels
+    double EPSTIME = 100e-9;    // ToF neighborhood radius, seconds — how far apart in ToF
+                                 // two pixel hits can be and still be the same ion/cluster
     int MINPOINTS = 1;          // Min number of points required to form a cluster (SELF EXCLUDED)
-    double TOFTHRESHOLD = 2e-4; // tof threshold for filtering points
+    // ToF acceptance window [TOFMIN, TOFMAX] (seconds). The real ToF peak sits
+    // at some instrument-dependent offset, not at zero, so this is a window
+    // around that peak, not a "max distance from zero" threshold.
+    double TOFMIN = 0.0;
+    double TOFMAX = 1.0;  // effectively unbounded unless overridden
 
     std::vector<const char*> positional_args;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--epsilon") == 0 && i + 1 < argc) {
             EPSILON = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--eps-time") == 0 && i + 1 < argc) {
+            EPSTIME = atof(argv[++i]);
         } else if (strcmp(argv[i], "--min-points") == 0 && i + 1 < argc) {
             MINPOINTS = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--tof-min") == 0 && i + 1 < argc) {
+            TOFMIN = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--tof-max") == 0 && i + 1 < argc) {
+            TOFMAX = atof(argv[++i]);
         } else if (strcmp(argv[i], "--tof-threshold") == 0 && i + 1 < argc) {
-            TOFTHRESHOLD = atof(argv[++i]);
+            // Legacy alias: sets only the upper bound, TOFMIN stays 0.
+            TOFMAX = atof(argv[++i]);
         } else {
             positional_args.push_back(argv[i]);
         }
@@ -156,7 +191,7 @@ int main(int argc, char* argv[]) {
     int npos = (int)positional_args.size();
     if (npos != 2 && npos != 3 && npos != 4) {
         std::cerr << "Usage: " << argv[0] << " <input_file> <output_file> [correction.txt] [labels_file]" << std::endl;
-        std::cerr << "Options: --epsilon <val>  --min-points <val>  --tof-threshold <val>" << std::endl;
+        std::cerr << "Options: --epsilon <val>  --eps-time <val>  --min-points <val>  --tof-min <val>  --tof-max <val>" << std::endl;
         return 1;
     }
 
@@ -187,14 +222,6 @@ int main(int argc, char* argv[]) {
         labelsFileName = positional_args[3];
     }
 
-    //tof parameters
-    const double TOFTTRANSFORM = 81920*(25./4096)*1E-9; //weird chemistry science stuff magic number maybe??
-    const double TOFTTOZ = EPSILON / TOFTTRANSFORM; //tof to z coordinate transformation factor
-
-    const int DOUBLEPRECISSION = 17; //number of digits for double precission
-    const int EXPECTEDNUMBERPOINTS = 5e5; //expected number of datapoints in input file
-
-    
     //linear interpolation of correction file (if provided)
     std::vector<double> tofVals;
     std::vector<double> correctionVals;
@@ -231,18 +258,32 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Get file size; each record is exactly 5 x double = 40 bytes
+    // Get file size. Each record is read directly in PyServal's EVENT_DTYPE
+    // on-disk layout (SERVAL/core/data_types.py): t_trigger(f8) x(u2) y(u2)
+    // tof(f8) tot(u4), tightly packed (numpy's default — no alignment padding),
+    // 8+2+2+8+4 = 24 bytes/record. Reading this layout directly avoids a
+    // separate Python-side conversion step and intermediate file entirely.
     inputFile.seekg(0, std::ios::end);
     long long fileSize = inputFile.tellg();
     inputFile.seekg(0, std::ios::beg);
     int lastReadProgress = -1;
 
-    long long nRecords = fileSize / 40;
+#pragma pack(push, 1)
+    struct RawRecord {
+        double   t_trigger;
+        uint16_t x;
+        uint16_t y;
+        double   tof;
+        uint32_t tot;
+    };
+#pragma pack(pop)
+    static_assert(sizeof(RawRecord) == 24, "RawRecord must match EVENT_DTYPE's packed 24-byte layout");
+
+    long long nRecords = fileSize / sizeof(RawRecord);
 
     // Chunked read: process CHUNK_RECORDS records per I/O call.
-    // Avoids per-record overhead while keeping memory use fixed (~40 MB/chunk).
-    struct RawRecord { double shot, x, y, tof, tot; };
-    const long long CHUNK_RECORDS = 1024 * 1024; // 1 M records = 40 MB
+    // Avoids per-record overhead while keeping memory use fixed (~24 MB/chunk).
+    const long long CHUNK_RECORDS = 1024 * 1024; // 1 M records = 24 MB
     std::vector<RawRecord> chunk(CHUNK_RECORDS);
 
     std::vector<Point> points;
@@ -253,13 +294,11 @@ int main(int argc, char* argv[]) {
 
     std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
 
-    double shotOffset = 0.0;
-    bool firstShot = true;
     long long recordsDone = 0;
 
     while (recordsDone < nRecords) {
         long long toRead = std::min(CHUNK_RECORDS, nRecords - recordsDone);
-        inputFile.read(reinterpret_cast<char*>(chunk.data()), toRead * 40);
+        inputFile.read(reinterpret_cast<char*>(chunk.data()), toRead * sizeof(RawRecord));
 
         for (long long i = 0; i < toRead; i++) {
             const RawRecord& r = chunk[i];
@@ -272,20 +311,16 @@ int main(int argc, char* argv[]) {
                 lastReadProgress = readPct;
             }
 
-            if (r.tof > TOFTHRESHOLD) continue;
+            if (r.tof < TOFMIN || r.tof > TOFMAX) continue;
 
             Point point;
-            point.shot    = r.shot;
+            point.shot    = r.t_trigger;
             point.x       = r.x;
             point.y       = r.y;
             point.tof     = r.tof;
             point.tot     = r.tot;
-            point.z       = r.tof * TOFTTOZ;
             point.label   = -1;
             point.visited = false;
-
-            if (firstShot) { shotOffset = r.shot; firstShot = false; }
-            point.shot = r.shot - shotOffset + 1;
 
             if (correctionFile.empty() == 0) {
                 double tofCorrection = interpolate(tofVals, correctionVals, point.tot);
@@ -329,7 +364,7 @@ int main(int argc, char* argv[]) {
     int shotsDone = 0;
     int lastDbscanProgress = 30;
     for (auto& pair : shotToPoints) {
-        dbscan(pair.second, EPSILON, MINPOINTS, clusterId);
+        dbscan(pair.second, EPSILON, EPSTIME, MINPOINTS, clusterId);
         shotsDone++;
         int dbscanPct = 30 + (totalShots > 0 ? (shotsDone * 60) / totalShots : 60);
         if (dbscanPct >= lastDbscanProgress + 5) {

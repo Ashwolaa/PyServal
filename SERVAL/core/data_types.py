@@ -109,6 +109,52 @@ class TriggerEdge(IntEnum):
         return [e.label for e in cls]
 
 
+# =============================================================================
+# Trigger combo bitmask — encodes which (tdc_id, edge) combinations were seen
+# =============================================================================
+
+#: Bits of a trigger-presence bitmask (see ``trigger_combo_bits``). One bit per
+#: (tdc_id, edge) combination; a record's ``tdc_id`` is always 1 or 2 in
+#: practice, so there are exactly 4 combos.
+TRIGGER_BIT_TDC1_RISING  = 1 << 0
+TRIGGER_BIT_TDC1_FALLING = 1 << 1
+TRIGGER_BIT_TDC2_RISING  = 1 << 2
+TRIGGER_BIT_TDC2_FALLING = 1 << 3
+
+_TRIGGER_BIT_LABELS = {
+    TRIGGER_BIT_TDC1_RISING:  "TDC1 rising",
+    TRIGGER_BIT_TDC1_FALLING: "TDC1 falling",
+    TRIGGER_BIT_TDC2_RISING:  "TDC2 rising",
+    TRIGGER_BIT_TDC2_FALLING: "TDC2 falling",
+}
+
+
+def trigger_combo_bits(tdc_id: np.ndarray, edge: np.ndarray) -> np.ndarray:
+    """
+    Vectorized per-record bit value for the (tdc_id, edge) combo.
+
+    ``tdc_id`` is expected to be 1 or 2 (hardware never tags a raw trigger
+    packet with 0 — that value is only a config sentinel meaning "either
+    channel"); any other value maps to 0 (no bit set).
+
+    Returns
+    -------
+    np.ndarray[uint8]
+        Same shape as the inputs, one of TRIGGER_BIT_* (or 0) per record.
+    """
+    tdc_id = np.asarray(tdc_id)
+    edge = np.asarray(edge)
+    valid = np.isin(tdc_id, (1, 2))
+    combo = np.zeros(tdc_id.shape, dtype=np.int64)
+    combo[valid] = (tdc_id[valid].astype(np.int64) - 1) * 2 + edge[valid].astype(np.int64)
+    return np.where(valid, (np.uint8(1) << combo), np.uint8(0)).astype(np.uint8)
+
+
+def decode_trigger_mask(mask: int) -> list:
+    """Return the list of human-readable trigger labels set in a trigger-mask byte."""
+    return [label for bit, label in _TRIGGER_BIT_LABELS.items() if mask & bit]
+
+
 @dataclass
 class PixelData:
     """

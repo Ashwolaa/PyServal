@@ -60,8 +60,43 @@ class HistogramController:
         self._mass_centers = (self._mass_edges[:-1] + self._mass_edges[1:]) / 2
         self._mass_counts = np.zeros(self._mass_bins, dtype=np.int64)
 
+        # Per-shot covariance accumulation.
+        # Uses the same TOF range as the main histogram but at a configurable
+        # (typically smaller) bin count.  For each laser shot we compute the
+        # 1-D TOF spectrum n_s (shape [B]) and accumulate:
+        #   S1 = Σ_s  n_s                    (sum of shot spectra)
+        #   S2 = Σ_s  n_s ⊗ n_s  =  A.T @ A  (sum of outer products)
+        # where A is the (shots × bins) matrix.  At display time:
+        #   corr(m1,m2) = S2 / N
+        #   cov(m1,m2)  = S2/N - outer(S1/N, S1/N)
+        self._cov_enabled = False
+        self._cov_bins = 200
+        self._cov_edges = np.linspace(tof_range[0], tof_range[1], 201)
+        self._cov_centers = (self._cov_edges[:-1] + self._cov_edges[1:]) / 2
+        self._cov_S1 = np.zeros(200, dtype=np.float64)
+        self._cov_S2 = np.zeros((200, 200), dtype=np.float64)
+        self._cov_n_shots = 0
+
         # Multiple ROIs: name -> {"tof_min": float, "tof_max": float, "hist": np.ndarray}
         self._rois = OrderedDict()
+
+        # Spatial (image-space) ROIs: (parent, name) -> {
+        #   "mask": np.ndarray(256,256,bool),
+        #   "op":   "+" include | "-" exclude (affects the combined mask),
+        #   "last_sampled_count": int,
+        #   "timeseries": [(elapsed, rate), ...],
+        #   "tof_hist": np.ndarray(tof_bins) — only populated for parent="" ROIs
+        # }
+        # "parent" is "" for the main pixel histogram, or a TOF-ROI name.
+        self._spatial_rois = OrderedDict()
+
+        # Per-parent combined-mask timeseries (union(+) AND NOT union(-)).
+        # keyed by parent str -> list of (elapsed, rate)
+        self._combined_timeseries: dict[str, list] = {}
+        self._combined_last_count: dict[str, int] = {}
+
+        # Per-parent combined-mask TOF histograms (only populated for parent="").
+        self._combined_tof_hists: dict[str, np.ndarray] = {}
 
         # Statistics
         self._total_events = 0
@@ -165,6 +200,37 @@ class HistogramController:
                         x_clipped[roi_mask], y_clipped[roi_mask]) * stride
 
 
+            # Per-spatial-ROI TOF histograms (total-image ROIs only).
+            has_total_spatial = any(p == "" for (p, _) in self._spatial_rois)
+            if has_total_spatial:
+                for (p, _n), roi_data in self._spatial_rois.items():
+                    if p != "":
+                        continue
+                    ev_mask = roi_data["mask"][x_clipped, y_clipped]
+                    if np.any(ev_mask):
+                        h, _ = np.histogram(tof_ns[ev_mask], bins=self._tof_edges)
+                        roi_data["tof_hist"] += h.astype(np.int64) * stride
+                combined = self._compute_combined_mask_locked("")
+                ev_mask = combined[x_clipped, y_clipped]
+                if np.any(ev_mask):
+                    h, _ = np.histogram(tof_ns[ev_mask], bins=self._tof_edges)
+                    if "" not in self._combined_tof_hists:
+                        self._combined_tof_hists[""] = np.zeros(self._tof_bins, dtype=np.int64)
+                    self._combined_tof_hists[""] += h.astype(np.int64) * stride
+
+            # Per-shot covariance accumulation.
+            # Build the (shots × bins) matrix A via np.add.at, then
+            # S1 += A.sum(axis=0)  and  S2 += A.T @ A  (single BLAS call).
+            if self._cov_enabled and len(event_num) > 0:
+                b = np.searchsorted(self._cov_edges[1:], tof_ns).clip(0, self._cov_bins - 1)
+                unique_shots, shot_ids = np.unique(event_num, return_inverse=True)
+                n_batch = len(unique_shots)
+                A = np.zeros((n_batch, self._cov_bins), dtype=np.float64)
+                np.add.at(A, (shot_ids, b), 1.0)
+                self._cov_S1 += A.sum(axis=0)
+                self._cov_S2 += A.T @ A
+                self._cov_n_shots += n_batch
+
             # Count unique trigger pulses in this batch.
             # event_num holds t_trigger — the absolute trigger TIME in seconds (float64),
             # one entry per correlated pixel hit.  Unique values = distinct laser shots.
@@ -225,6 +291,24 @@ class HistogramController:
                 if np.any(roi_mask):
                     roi_data["hist"] += self._bincount_2d(
                         x_clipped[roi_mask], y_clipped[roi_mask]) * stride
+
+            # Per-spatial-ROI TOA histograms (total-image ROIs only).
+            has_total_spatial = any(p == "" for (p, _) in self._spatial_rois)
+            if has_total_spatial:
+                for (p, _n), roi_data in self._spatial_rois.items():
+                    if p != "":
+                        continue
+                    ev_mask = roi_data["mask"][x_clipped, y_clipped]
+                    if np.any(ev_mask):
+                        h, _ = np.histogram(toa_ns[ev_mask], bins=self._tof_edges)
+                        roi_data["tof_hist"] += h.astype(np.int64) * stride
+                combined = self._compute_combined_mask_locked("")
+                ev_mask = combined[x_clipped, y_clipped]
+                if np.any(ev_mask):
+                    h, _ = np.histogram(toa_ns[ev_mask], bins=self._tof_edges)
+                    if "" not in self._combined_tof_hists:
+                        self._combined_tof_hists[""] = np.zeros(self._tof_bins, dtype=np.int64)
+                    self._combined_tof_hists[""] += h.astype(np.int64) * stride
 
             self._total_pixels += len(x) * stride
 
@@ -340,6 +424,40 @@ class HistogramController:
                 if len(roi_data["timeseries"]) > self._max_timeseries_points:
                     roi_data["timeseries"].pop(0)
 
+            # Add spatial ROI counts/shot samples (same delta_triggers/elapsed as above)
+            for key, roi_data in self._spatial_rois.items():
+                parent_arr = self._get_parent_array_locked(key[0])
+                if parent_arr is None:
+                    continue
+                roi_counts = self._sum_mask(parent_arr, roi_data["mask"])
+                last_count = roi_data.get("last_sampled_count", 0)
+
+                delta_roi = roi_counts - last_count
+                roi_rate = delta_roi / delta_triggers if delta_triggers > 0 else float(delta_roi)
+
+                roi_data["last_sampled_count"] = roi_counts
+
+                roi_data["timeseries"].append((elapsed, roi_rate))
+                if len(roi_data["timeseries"]) > self._max_timeseries_points:
+                    roi_data["timeseries"].pop(0)
+
+            # Sample the combined mask for every parent that has spatial ROIs
+            seen_parents = set(k[0] for k in self._spatial_rois)
+            for parent in seen_parents:
+                parent_arr = self._get_parent_array_locked(parent)
+                if parent_arr is None:
+                    continue
+                combined_mask = self._compute_combined_mask_locked(parent)
+                combined_counts = int((parent_arr * combined_mask).sum())
+                last_c = self._combined_last_count.get(parent, 0)
+                delta_c = combined_counts - last_c
+                rate_c = delta_c / delta_triggers if delta_triggers > 0 else float(delta_c)
+                self._combined_last_count[parent] = combined_counts
+                ts = self._combined_timeseries.setdefault(parent, [])
+                ts.append((elapsed, rate_c))
+                if len(ts) > self._max_timeseries_points:
+                    ts.pop(0)
+
     def get_timeseries(self, name=None):
         """
         Get time series data.
@@ -379,6 +497,8 @@ class HistogramController:
             for roi_data in self._rois.values():
                 if "timeseries" in roi_data:
                     roi_data["timeseries"].clear()
+            for roi_data in self._spatial_rois.values():
+                roi_data["timeseries"].clear()
 
     def clear(self):
         """Clear all histogram data (keeps ROI definitions and timeseries)."""
@@ -399,6 +519,26 @@ class HistogramController:
             for roi_data in self._rois.values():
                 roi_data["hist"].fill(0)
                 roi_data["last_sampled_count"] = 0
+
+            # Reset covariance accumulators
+            self._cov_S1.fill(0)
+            self._cov_S2.fill(0)
+            self._cov_n_shots = 0
+
+            # Reset combined-mask timeseries
+            for k in self._combined_timeseries:
+                self._combined_timeseries[k] = []
+            for k in self._combined_last_count:
+                self._combined_last_count[k] = 0
+
+            # Spatial ROIs share the data already in self._pixel_hist / self._rois[*]["hist"],
+            # so just reset their sampling baseline and TOF histograms (geometry is untouched).
+            for roi_data in self._spatial_rois.values():
+                roi_data["last_sampled_count"] = 0
+                if "tof_hist" in roi_data:
+                    roi_data["tof_hist"].fill(0)
+            for arr in self._combined_tof_hists.values():
+                arr.fill(0)
 
     def set_tof_config(self, tof_range=None, tof_bins=None):
         """
@@ -422,6 +562,24 @@ class HistogramController:
             )
             self._tof_centers = (self._tof_edges[:-1] + self._tof_edges[1:]) / 2
             self._tof_counts = np.zeros(self._tof_bins, dtype=np.int64)
+
+            # Re-bin spatial ROI TOF histograms to new size
+            for roi_data in self._spatial_rois.values():
+                if "tof_hist" in roi_data:
+                    roi_data["tof_hist"] = np.zeros(self._tof_bins, dtype=np.int64)
+            self._combined_tof_hists = {
+                k: np.zeros(self._tof_bins, dtype=np.int64)
+                for k in self._combined_tof_hists
+            }
+
+            # Re-bin covariance to match the new TOF range
+            if tof_range is not None:
+                self._cov_edges = np.linspace(
+                    self._tof_range[0], self._tof_range[1], self._cov_bins + 1)
+                self._cov_centers = (self._cov_edges[:-1] + self._cov_edges[1:]) / 2
+                self._cov_S1.fill(0)
+                self._cov_S2.fill(0)
+                self._cov_n_shots = 0
 
     # =========================================================================
     # TOF -> Mass (m/z) Calibration
@@ -472,6 +630,44 @@ class HistogramController:
             )
             self._mass_centers = (self._mass_edges[:-1] + self._mass_edges[1:]) / 2
             self._mass_counts = np.zeros(self._mass_bins, dtype=np.int64)
+
+    # =========================================================================
+    # Per-shot covariance
+    # =========================================================================
+
+    def enable_covariance(self, enabled: bool):
+        with self._lock:
+            self._cov_enabled = enabled
+
+    def set_covariance_config(self, bins: int):
+        """Resize the covariance accumulators and reset all accumulated data."""
+        with self._lock:
+            self._cov_bins = bins
+            self._cov_edges = np.linspace(
+                self._tof_range[0], self._tof_range[1], bins + 1)
+            self._cov_centers = (self._cov_edges[:-1] + self._cov_edges[1:]) / 2
+            self._cov_S1 = np.zeros(bins, dtype=np.float64)
+            self._cov_S2 = np.zeros((bins, bins), dtype=np.float64)
+            self._cov_n_shots = 0
+
+    def get_covariance_map(self):
+        """Return (centers_ns, covariance_2d, correlation_2d, n_shots).
+
+        centers_ns  : bin centres in nanoseconds (shape [B])
+        covariance  : C = <n·n>/N - outer(<n>/N, <n>/N)  (shape [B,B])
+        correlation : <n·n>/N  (shape [B,B])
+        n_shots     : number of laser shots accumulated
+        """
+        with self._lock:
+            n = self._cov_n_shots
+            centers = self._cov_centers.copy()
+            if n < 2:
+                z = np.zeros((self._cov_bins, self._cov_bins))
+                return centers, z, z, 0
+            corr = self._cov_S2 / n
+            mean = self._cov_S1 / n
+            cov  = corr - np.outer(mean, mean)
+            return centers, cov, corr, n
 
     # =========================================================================
     # Multiple ROI Support
@@ -584,6 +780,182 @@ class HistogramController:
             if name in self._rois:
                 return int(self._rois[name]["hist"].sum())
             return 0
+
+    # =========================================================================
+    # Spatial (image-space) ROI support
+    # =========================================================================
+    # NOTE on indexing: _bincount_2d builds flat = x*256 + y then
+    # reshape(256, 256), so every 2D histogram array here is indexed [x, y]
+    # (not the usual [row=y, col=x]). A rectangle drawn on an image plot at
+    # pos=(x, y), size=(w, h) is therefore summed as arr[x:x+w, y:y+h] with
+    # no transpose.  Ellipse masks use the same (x, y) convention.
+
+    def _get_parent_array_locked(self, parent):
+        """Return the 2D histogram array identified by *parent* (caller must
+        already hold self._lock). "" -> main pixel histogram; otherwise a
+        TOF-ROI name -> that ROI's filtered histogram. None if not found."""
+        if parent == "":
+            return self._pixel_hist
+        roi_data = self._rois.get(parent)
+        return roi_data["hist"] if roi_data is not None else None
+
+    @staticmethod
+    def _make_mask(shape: str, x: int, y: int, w: int, h: int,
+                   size: int = 256) -> np.ndarray:
+        """Compute a boolean pixel mask for *shape* in a *size*×*size* grid.
+
+        shape: "rect" or "ellipse".  (x, y) is the top-left corner of the
+        bounding box in [x, y] histogram indexing (x = column, y = row).
+        """
+        if shape == "rect":
+            mask = np.zeros((size, size), dtype=bool)
+            x0, x1 = max(0, x), min(size, x + w)
+            y0, y1 = max(0, y), min(size, y + h)
+            if x1 > x0 and y1 > y0:
+                mask[x0:x1, y0:y1] = True
+        elif shape == "ellipse":
+            cx, cy = x + w / 2.0, y + h / 2.0
+            rx, ry = w / 2.0, h / 2.0
+            if rx > 0 and ry > 0:
+                X, Y = np.ogrid[0:size, 0:size]
+                mask = ((X - cx) ** 2 / rx ** 2 + (Y - cy) ** 2 / ry ** 2) <= 1.0
+            else:
+                mask = np.zeros((size, size), dtype=bool)
+        else:
+            mask = np.zeros((size, size), dtype=bool)
+        return mask
+
+    @staticmethod
+    def _sum_mask(arr, mask: np.ndarray) -> int:
+        return int((arr * mask).sum())
+
+    def _compute_combined_mask_locked(self, parent: str) -> np.ndarray:
+        """Compute union(include) AND NOT union(exclude) for *parent*'s ROIs.
+        Returns all-False if there are no include ROIs."""
+        N = 256
+        include = np.zeros((N, N), dtype=bool)
+        exclude = np.zeros((N, N), dtype=bool)
+        has_include = False
+        for (p, _n), roi_data in self._spatial_rois.items():
+            if p != parent:
+                continue
+            if roi_data.get("op", "+") == "+":
+                include |= roi_data["mask"]
+                has_include = True
+            else:
+                exclude |= roi_data["mask"]
+        if not has_include:
+            return np.zeros((N, N), dtype=bool)
+        return include & ~exclude
+
+    def add_spatial_roi(self, parent, name, shape, op, x, y, w, h):
+        """Add a spatial ROI (rect or ellipse) on the image identified by *parent*."""
+        with self._lock:
+            entry = {
+                "mask": self._make_mask(shape, x, y, w, h),
+                "op": op,
+                "last_sampled_count": 0,
+                "timeseries": [],
+            }
+            if parent == "":
+                entry["tof_hist"] = np.zeros(self._tof_bins, dtype=np.int64)
+            self._spatial_rois[(parent, name)] = entry
+
+    def update_spatial_roi(self, parent, name, shape, op, x, y, w, h):
+        """Update an existing spatial ROI's geometry and/or operation."""
+        with self._lock:
+            key = (parent, name)
+            if key not in self._spatial_rois:
+                return
+            roi_data = self._spatial_rois[key]
+            roi_data["mask"] = self._make_mask(shape, x, y, w, h)
+            roi_data["op"] = op
+            roi_data["last_sampled_count"] = 0
+            if parent == "" and "tof_hist" in roi_data:
+                roi_data["tof_hist"].fill(0)
+            # Combined mask changed — reset its TOF histogram too
+            if parent in self._combined_tof_hists:
+                self._combined_tof_hists[parent].fill(0)
+
+    def remove_spatial_roi(self, parent, name):
+        """Remove a single spatial ROI."""
+        with self._lock:
+            self._spatial_rois.pop((parent, name), None)
+            # Clear combined timeseries cache for this parent so it restarts clean
+            self._combined_timeseries.pop(parent, None)
+            self._combined_last_count.pop(parent, None)
+            # If no more ROIs for this parent, discard combined TOF histogram
+            if not any(p == parent for (p, _) in self._spatial_rois):
+                self._combined_tof_hists.pop(parent, None)
+            elif parent in self._combined_tof_hists:
+                # Combined mask changed — restart accumulation
+                self._combined_tof_hists[parent].fill(0)
+
+    def remove_spatial_rois_for_parent(self, parent):
+        """Remove every spatial ROI belonging to *parent* (used when a TOF
+        ROI dock is closed or renamed)."""
+        with self._lock:
+            for key in [k for k in self._spatial_rois if k[0] == parent]:
+                del self._spatial_rois[key]
+            self._combined_timeseries.pop(parent, None)
+            self._combined_last_count.pop(parent, None)
+            self._combined_tof_hists.pop(parent, None)
+
+    def get_spatial_roi_counts(self, parent, name):
+        """Get total counts currently inside a spatial ROI."""
+        with self._lock:
+            roi_data = self._spatial_rois.get((parent, name))
+            if roi_data is None:
+                return 0
+            arr = self._get_parent_array_locked(parent)
+            if arr is None:
+                return 0
+            return self._sum_mask(arr, roi_data["mask"])
+
+    def get_spatial_roi_timeseries(self, parent, name):
+        """Get the counts/shot time series for a spatial ROI."""
+        with self._lock:
+            roi_data = self._spatial_rois.get((parent, name))
+            if roi_data is None or not roi_data["timeseries"]:
+                return np.array([]), np.array([])
+            times = np.array([t for t, _ in roi_data["timeseries"]])
+            counts = np.array([c for _, c in roi_data["timeseries"]])
+            return times, counts
+
+    def get_spatial_roi_tof(self, parent, name):
+        """Return (bin_centers_ns, counts) for the spatially-filtered TOF histogram."""
+        with self._lock:
+            roi_data = self._spatial_rois.get((parent, name))
+            if roi_data is None or "tof_hist" not in roi_data:
+                return self._tof_centers.copy(), np.zeros(self._tof_bins, dtype=np.int64)
+            return self._tof_centers.copy(), roi_data["tof_hist"].copy()
+
+    def get_combined_tof(self, parent):
+        """Return (bin_centers_ns, counts) for the combined-mask TOF histogram."""
+        with self._lock:
+            counts = self._combined_tof_hists.get(parent)
+            if counts is None:
+                return self._tof_centers.copy(), np.zeros(self._tof_bins, dtype=np.int64)
+            return self._tof_centers.copy(), counts.copy()
+
+    def get_combined_counts(self, parent) -> int:
+        """Counts under the combined (include AND NOT exclude) mask for *parent*."""
+        with self._lock:
+            arr = self._get_parent_array_locked(parent)
+            if arr is None:
+                return 0
+            mask = self._compute_combined_mask_locked(parent)
+            return self._sum_mask(arr, mask)
+
+    def get_combined_timeseries(self, parent):
+        """Counts/shot time series for the combined mask."""
+        with self._lock:
+            ts = self._combined_timeseries.get(parent, [])
+            if not ts:
+                return np.array([]), np.array([])
+            times = np.array([t for t, _ in ts])
+            counts = np.array([c for _, c in ts])
+            return times, counts
 
     # Legacy compatibility
     def set_tof_range(self, tof_range, tof_bins=None):

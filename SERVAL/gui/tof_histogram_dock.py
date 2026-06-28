@@ -19,6 +19,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QTableWidget,
     QToolBar,
     QVBoxLayout,
@@ -157,7 +158,10 @@ class TofHistogramDock(Dock):
             brush=(100, 100, 200, 100),
         )
         self.tof_plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
-        layout.addWidget(self.tof_plot, stretch=3)
+
+        # Overlay curves for spatially-filtered TOF spectra (total-image spatial ROIs)
+        self._spatial_tof_curves: dict[str, pg.PlotDataItem] = {}
+        self._combined_tof_curve: pg.PlotDataItem | None = None
 
         # ── Display settings panel (hidden by default) ────────────────────────
         self.display_tree = ParameterTree()
@@ -235,10 +239,15 @@ class TofHistogramDock(Dock):
         self.roi_table.setColumnWidth(4, 30)
         self.roi_table.setColumnWidth(5, 30)
         self.roi_table.verticalHeader().setVisible(False)
-        self.roi_table.setMaximumHeight(150)
         roi_layout.addWidget(self.roi_table)
 
-        layout.addWidget(self._roi_container)
+        # ── Splitter: TOF plot (top) / ROI container (bottom) ────────────────
+        self._vsplitter = QSplitter(Qt.Orientation.Vertical)
+        self._vsplitter.addWidget(self.tof_plot)
+        self._vsplitter.addWidget(self._roi_container)
+        self._vsplitter.setStretchFactor(0, 4)
+        self._vsplitter.setStretchFactor(1, 1)
+        layout.addWidget(self._vsplitter)
         self.addWidget(widget)
 
     # -------------------------------------------------------------------------
@@ -272,3 +281,40 @@ class TofHistogramDock(Dock):
 
     def set_x_label(self, label: str):
         self.tof_plot.setLabel('bottom', label)
+
+    # -------------------------------------------------------------------------
+    # Spatially-filtered TOF overlay curves
+    # -------------------------------------------------------------------------
+
+    def add_spatial_tof_curve(self, name: str, color):
+        if name in self._spatial_tof_curves:
+            return
+        curve = self.tof_plot.plot(
+            pen=pg.mkPen(color=color[:3], width=1.5),
+            name=name,
+        )
+        self._spatial_tof_curves[name] = curve
+
+    def update_spatial_tof_curve(self, name: str, centers, counts):
+        curve = self._spatial_tof_curves.get(name)
+        if curve is not None:
+            curve.setData(centers, counts)
+
+    def remove_spatial_tof_curve(self, name: str):
+        curve = self._spatial_tof_curves.pop(name, None)
+        if curve is not None:
+            self.tof_plot.removeItem(curve)
+
+    def update_combined_tof_curve(self, centers, counts):
+        if self._combined_tof_curve is None:
+            self._combined_tof_curve = self.tof_plot.plot(
+                pen=pg.mkPen(color='w', width=2,
+                             style=pg.QtCore.Qt.PenStyle.DashLine),
+                name="Spatial (combined)",
+            )
+        self._combined_tof_curve.setData(centers, counts)
+
+    def remove_combined_tof_curve(self):
+        if self._combined_tof_curve is not None:
+            self.tof_plot.removeItem(self._combined_tof_curve)
+            self._combined_tof_curve = None

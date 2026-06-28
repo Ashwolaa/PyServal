@@ -15,7 +15,7 @@ from typing import Optional, Union
 
 import numpy as np
 
-from SERVAL.core.data_types import EVENT_DTYPE, PIXEL_DTYPE, TRIGGER_DTYPE
+from SERVAL.core.data_types import EVENT_DTYPE, PIXEL_DTYPE, TRIGGER_DTYPE, trigger_combo_bits
 
 
 class TPX3Run:
@@ -44,10 +44,10 @@ class TPX3Run:
         self._events: Optional[np.ndarray] = None
         self._triggers: Optional[np.ndarray] = None
         self._pixels: Optional[np.ndarray] = None
+        self._centroids: Optional[np.ndarray] = None
 
-        # Index for fast per-trigger slicing
-        self._trigger_vals: Optional[np.ndarray] = None
-        self._event_starts: Optional[np.ndarray] = None
+        # Cached per-row shot index for events (see events_shot_index)
+        self._events_shot_index: Optional[np.ndarray] = None
 
         self._load_meta()
 
@@ -64,10 +64,17 @@ class TPX3Run:
                 if "edge" in self._meta:
                     self._edge = self._meta["edge"]
         elif self._path.is_file():
-            # Single file — look for metadata alongside it
+            # Single file — look for metadata alongside it. Prefer an
+            # exact-name match (one metadata file per take), but fall back to
+            # any *_meta.json in the same directory — e.g. a PyMoDAQ scan's
+            # centralized "_scan_meta.json" shared by every step file, which
+            # has no per-step counterpart.
             meta_path = self._path.parent / (
                 self._path.name.replace("_events.dat", "_meta.json")
             )
+            if not meta_path.exists():
+                candidates = sorted(self._path.parent.glob("*_meta.json"))
+                meta_path = candidates[0] if candidates else meta_path
             if meta_path.exists():
                 with open(meta_path) as f:
                     self._meta = json.load(f)
@@ -111,11 +118,21 @@ class TPX3Run:
 
     @property
     def events(self) -> np.ndarray:
-        """EVENT_DTYPE array sorted by t_trigger."""
+        """
+        EVENT_DTYPE array sorted by ``t_trigger``. ``t_trigger`` is rebased
+        to be relative to this run's start (``t0``) rather than the chip's
+        free-running internal clock — see ``t0`` for why that distinction
+        matters. Use ``t0 + events["t_trigger"]`` to recover the original
+        chip-clock value (e.g. to cross-reference against ``triggers``).
+        """
         if self._events is None:
-            self._events = self._load_array("*_events.dat", EVENT_DTYPE, "t_trigger")
-            if self._events is None:
-                self._events = np.empty(0, dtype=EVENT_DTYPE)
+            raw = self._load_array("*_events.dat", EVENT_DTYPE, "t_trigger")
+            if raw is None:
+                raw = np.empty(0, dtype=EVENT_DTYPE)
+            elif len(raw):
+                raw = raw.copy()
+                raw["t_trigger"] = raw["t_trigger"] - self.t0
+            self._events = raw
         return self._events
 
     @property
@@ -129,12 +146,44 @@ class TPX3Run:
 
     @property
     def primary_triggers(self) -> np.ndarray:
-        """Subset of triggers used for correlation (tdc_id + rising edge)."""
+        """Subset of triggers used for correlation (tdc_id + edge)."""
         t = self.triggers
         if len(t) == 0:
             return t
-        mask = (t["tdc_id"] == self._tdc_id) & (t["edge"] == self._edge)
+        if self._tdc_id == 0:  # TDCChannel.BOTH — "either channel", never a real packet tag
+            mask = t["edge"] == self._edge
+        else:
+            mask = (t["tdc_id"] == self._tdc_id) & (t["edge"] == self._edge)
         return t[mask]
+
+    def trigger_mask_per_shot(self) -> np.ndarray:
+        """
+        Per-shot bitmask of which (tdc_id, edge) combos occurred.
+
+        Shot ``i`` spans from ``primary_triggers[i]`` up to (but not
+        including) ``primary_triggers[i + 1]``. This returns, for each shot,
+        the OR of ``trigger_combo_bits`` over every raw trigger record (any
+        channel/edge) falling in that window — i.e. whether an "extra"
+        trigger (e.g. a second TDC2 pulse) occurred during the shot used for
+        ToF correlation. See ``TRIGGER_BIT_*`` in ``SERVAL.core.data_types``.
+
+        Returns
+        -------
+        np.ndarray[uint8]
+            Same length as ``primary_triggers``.
+        """
+        t = self.triggers
+        if len(t) == 0:
+            return np.empty(0, dtype=np.uint8)
+        if self._tdc_id == 0:
+            ref_mask = t["edge"] == self._edge
+        else:
+            ref_mask = (t["tdc_id"] == self._tdc_id) & (t["edge"] == self._edge)
+        ref_positions = np.flatnonzero(ref_mask)
+        if len(ref_positions) == 0:
+            return np.empty(0, dtype=np.uint8)
+        bit_vals = trigger_combo_bits(t["tdc_id"], t["edge"])
+        return np.bitwise_or.reduceat(bit_vals, ref_positions)
 
     @property
     def pixels(self) -> Optional[np.ndarray]:
@@ -143,58 +192,143 @@ class TPX3Run:
             self._pixels = self._load_array("*_pixels.dat", PIXEL_DTYPE, "toa")
         return self._pixels  # may still be None
 
+    @property
+    def centroids(self) -> np.ndarray:
+        """
+        MERGED_CENTROID_DTYPE array from ``<run_name>_centroids.datbin``, as
+        written by ``CentroidProcessor.process_run_dir_merged`` (see
+        ``SERVAL.postprocessing.centroiding``). Already sorted by
+        ``shot_index`` on disk; empty array if the file doesn't exist yet.
+
+        ``shot_index`` indexes into the same ``primary_triggers`` array as
+        ``events`` does via ``t_trigger`` — i.e. row ``i`` of
+        ``primary_triggers`` corresponds to ``shot_index == i`` here.
+
+        Like ``events``, ``t_trigger`` is rebased relative to this run's
+        start (``t0``) — see ``events`` / ``t0`` for why.
+        """
+        if self._centroids is None:
+            # Deferred import: SERVAL.postprocessing.centroiding imports
+            # TPX3Run from this module, so importing it at module load time
+            # would deadlock.
+            from SERVAL.postprocessing.centroiding import MERGED_CENTROID_DTYPE
+
+            if self._path.is_dir():
+                run_name = self._path.name
+                centroid_file = self._path / f"{run_name}_centroids.datbin"
+            else:
+                stem = self._path.stem
+                import re
+                stem = re.sub(r"_saver\d+_events$", "", stem)
+                stem = re.sub(r"_events$", "", stem)
+                centroid_file = self._path.parent / f"{stem}_centroids.datbin"
+
+            if centroid_file.exists() and centroid_file.stat().st_size > 0:
+                c = np.fromfile(str(centroid_file), dtype=MERGED_CENTROID_DTYPE)
+                if len(c):
+                    c["t_trigger"] = c["t_trigger"] - self.t0
+                self._centroids = c
+            else:
+                self._centroids = np.empty(0, dtype=MERGED_CENTROID_DTYPE)
+        return self._centroids
+
+    @property
+    def t0(self) -> float:
+        """
+        Run time origin (seconds) in the chip's free-running clock — the
+        clock keeps counting from chip power-on, not from "start
+        measurement", so without this offset every timestamp carries an
+        arbitrary, often large, baseline (e.g. ~2536 s into a session that
+        started well before this particular recording).
+
+        ``events`` and ``centroids`` are pre-rebased by this value (so they
+        read close to 0 at the start of the run); ``triggers`` /
+        ``primary_triggers`` are left in raw chip-clock seconds, since
+        ``t0`` is derived from them.
+
+        First primary trigger's ``toa`` if trigger files are present, else
+        the first raw event's ``t_trigger`` (read directly, bypassing the
+        ``events`` property, to avoid a circular rebase), else 0.0.
+        """
+        primary = self.primary_triggers
+        if len(primary):
+            return float(primary["toa"][0])
+        raw = self._load_array("*_events.dat", EVENT_DTYPE, "t_trigger")
+        if raw is not None and len(raw):
+            return float(raw["t_trigger"][0])
+        return 0.0
+
+    @property
+    def events_shot_index(self) -> np.ndarray:
+        """
+        Absolute shot index (0-based index into ``primary_triggers``) for
+        each row of ``events`` — computed the same way as
+        ``centroids["shot_index"]``: an exact ``np.searchsorted`` of
+        ``t_trigger`` against ``primary_triggers["toa"]``. A shot with zero
+        events simply doesn't appear here, so this is directly comparable
+        to ``centroids["shot_index"]`` (e.g. to find shots with zero counts
+        in either array: ``set(range(len(primary_triggers))) - set(idx)``).
+        """
+        if self._events_shot_index is None:
+            ev = self.events
+            primary = self.primary_triggers
+            if len(ev) == 0 or len(primary) == 0:
+                self._events_shot_index = np.empty(0, dtype=np.int64)
+            else:
+                # ev["t_trigger"] is rebased relative to t0 (see `events`);
+                # primary["toa"] is not, so shift it the same way before
+                # comparing — searchsorted needs both sides on one basis.
+                self._events_shot_index = np.searchsorted(
+                    primary["toa"] - self.t0, ev["t_trigger"]
+                )
+        return self._events_shot_index
+
     # -------------------------------------------------------------------------
     # Derived quantities
     # -------------------------------------------------------------------------
 
     def absolute_times(self) -> np.ndarray:
-        """Absolute pixel hit time = t_trigger + tof (seconds)."""
+        """
+        Pixel hit time = t_trigger + tof (seconds), relative to this run's
+        start (``t0``) since ``t_trigger`` is already rebased — add ``t0``
+        back for the true chip-clock value.
+        """
         ev = self.events
         return ev["t_trigger"] + ev["tof"]
 
     # -------------------------------------------------------------------------
-    # Fast per-trigger slicing
+    # Fast per-shot slicing — events and centroids both indexed by the
+    # absolute shot index (position in primary_triggers), via searchsorted
+    # on the already-sorted index column. A shot with zero rows just leaves
+    # a gap rather than shifting later shots down.
     # -------------------------------------------------------------------------
 
-    def build_event_index(self):
-        """
-        Build index: unique sorted t_trigger values + searchsorted positions.
-        Called automatically on first get_events_for_trigger call.
-        """
+    def get_events_for_shot(self, i: int) -> np.ndarray:
+        """Return all events belonging to the i-th primary trigger / shot."""
+        return self.get_events_in_shot_range(i, i + 1)
+
+    def get_events_in_shot_range(self, start: int, stop: int) -> np.ndarray:
+        """Return events for primary trigger / shot indices [start, stop)."""
         ev = self.events
-        if len(ev) == 0:
-            self._trigger_vals = np.empty(0, dtype=np.float64)
-            self._event_starts = np.empty(0, dtype=np.intp)
-            return
-        unique_vals, first_idx = np.unique(ev["t_trigger"], return_index=True)
-        self._trigger_vals = unique_vals
-        self._event_starts = first_idx
+        if len(ev) == 0 or stop <= start:
+            return np.empty(0, dtype=ev.dtype)
+        shot_idx = self.events_shot_index
+        idx_start = np.searchsorted(shot_idx, start)
+        idx_end = np.searchsorted(shot_idx, stop)
+        return ev[idx_start:idx_end]
 
-    def get_events_for_trigger(self, i: int) -> np.ndarray:
-        """Return all events for the i-th primary trigger (by index)."""
-        if self._trigger_vals is None:
-            self.build_event_index()
-        starts = self._event_starts
-        n = len(starts)
-        if i < 0 or i >= n:
-            return np.empty(0, dtype=EVENT_DTYPE)
-        start = starts[i]
-        end = starts[i + 1] if i + 1 < n else len(self.events)
-        return self.events[start:end]
+    def get_centroids_for_shot(self, i: int) -> np.ndarray:
+        """Return all centroids belonging to the i-th primary trigger / shot."""
+        return self.get_centroids_in_shot_range(i, i + 1)
 
-    def get_events_in_range(self, start: int, stop: int) -> np.ndarray:
-        """Return events for primary trigger indices [start, stop)."""
-        if self._trigger_vals is None:
-            self.build_event_index()
-        starts = self._event_starts
-        n = len(starts)
-        if start >= n or stop <= 0:
-            return np.empty(0, dtype=EVENT_DTYPE)
-        start = max(start, 0)
-        stop = min(stop, n)
-        idx_start = starts[start]
-        idx_end = starts[stop] if stop < n else len(self.events)
-        return self.events[idx_start:idx_end]
+    def get_centroids_in_shot_range(self, start: int, stop: int) -> np.ndarray:
+        """Return centroids for primary trigger / shot indices [start, stop)."""
+        c = self.centroids
+        if len(c) == 0 or stop <= start:
+            return np.empty(0, dtype=c.dtype)
+        idx_start = np.searchsorted(c["shot_index"], start)
+        idx_end = np.searchsorted(c["shot_index"], stop)
+        return c[idx_start:idx_end]
 
     # -------------------------------------------------------------------------
     # Repr

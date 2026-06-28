@@ -6,13 +6,15 @@ Also exports ROI_COLORS, the default colour palette for TOF ROI regions.
 
 import pyqtgraph as pg
 from pyqtgraph.dockarea import Dock
-from qtpy.QtCore import Qt, QSize
+from qtpy.QtCore import Qt, QSize, Signal
 from qtpy.QtWidgets import (
     QAction,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QSizePolicy,
     QSplitter,
+    QTableWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -37,8 +39,12 @@ ROI_COLORS = [
 class ImageDockWidget(Dock):
     """Dock widget containing a 2D histogram image with counts display and time series plot."""
 
-    def __init__(self, title, color=None, parent=None):
-        super().__init__(title, closable=True, size=(300, 400))
+    # Emitted by the ROI mini-toolbar; wire to a SpatialROIManager's add_roi/remove_roi.
+    add_roi_clicked = Signal()
+    remove_roi_clicked = Signal()
+
+    def __init__(self, title, color=None, closable=True, parent=None):
+        super().__init__(title, closable=closable, size=(300, 400))
         self._color = color
 
         # Main widget
@@ -113,6 +119,17 @@ class ImageDockWidget(Dock):
         self.timeseries_check.toggled.connect(self._on_timeseries_toggled)
         header_tb.addAction(self.timeseries_check)
 
+        # ROI table toggle (orange = hidden, green = visible)
+        self.roi_table_check = QAction(
+            create_icon('table_rows', icon_color='orange', icon_checked_color='green'),
+            'ROI Table', self
+        )
+        self.roi_table_check.setCheckable(True)
+        self.roi_table_check.setChecked(False)
+        self.roi_table_check.setToolTip("Show/hide the spatial ROI table for this image")
+        self.roi_table_check.toggled.connect(self._on_roi_table_toggled)
+        header_tb.addAction(self.roi_table_check)
+
         layout.addWidget(header_tb)
 
         # Image plot
@@ -147,16 +164,72 @@ class ImageDockWidget(Dock):
         self.timeseries_plot.setLabel('bottom', 'Time', units='s')
         self.timeseries_plot.showGrid(x=True, y=True, alpha=0.3)
         pen_color = color[:3] if color else (100, 100, 255)
-        self.timeseries_curve = self.timeseries_plot.plot(pen=pg.mkPen(color=pen_color, width=2))
+        self.timeseries_curve = self.timeseries_plot.plot(
+            pen=pg.mkPen(color=pen_color, width=2), name='Total')
         self.timeseries_plot.setVisible(True)
+        self._timeseries_legend = self.timeseries_plot.addLegend()
+        self._roi_curves = {}  # name -> PlotDataItem, for spatial ROI counts/shot curves
 
-        # Vertical splitter — drag the handle to resize the image relative to the time series plot
+        # Vertical splitter — drag the handles to resize image / timeseries / ROI panel
         self._vsplitter = QSplitter(Qt.Orientation.Vertical)
         self._vsplitter.addWidget(self._image_container)
         self._vsplitter.addWidget(self.timeseries_plot)
         self._vsplitter.setStretchFactor(0, 3)
         self._vsplitter.setStretchFactor(1, 1)
         layout.addWidget(self._vsplitter)
+
+        # ROI panel (hidden by default, lives inside the splitter so it is resizable)
+        # — mini-toolbar + spatial ROI table.
+        # Populated/driven externally by a SpatialROIManager (this widget stays
+        # a dumb container, same division of labour as TofHistogramDock/ROIManager).
+        self._roi_container = QWidget()
+        self._roi_container.setVisible(False)
+        roi_layout = QVBoxLayout(self._roi_container)
+        roi_layout.setContentsMargins(0, 0, 0, 0)
+        roi_layout.setSpacing(1)
+
+        roi_tb = QToolBar()
+        roi_tb.setIconSize(QSize(14, 14))
+        roi_tb.setMovable(False)
+        roi_tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+
+        add_roi_action = QAction(create_icon('add_circle'), 'Add ROI', self)
+        add_roi_action.setToolTip("Add a spatial ROI rectangle on this image")
+        add_roi_action.triggered.connect(self.add_roi_clicked)
+        roi_tb.addAction(add_roi_action)
+
+        remove_roi_action = QAction(create_icon('remove'), 'Remove ROI', self)
+        remove_roi_action.setToolTip("Remove a spatial ROI")
+        remove_roi_action.triggered.connect(self.remove_roi_clicked)
+        roi_tb.addAction(remove_roi_action)
+
+        roi_layout.addWidget(roi_tb)
+
+        # ROI table — cols: color | name | shape | op | x | y | w | h | counts | yield% | vis | lock
+        # Shape (col 2): "▭" rect  / "○" ellipse  — click to cycle
+        # Op    (col 3): "⊕" include / "⊖" exclude — click to toggle; drives the combined mask
+        self.roi_table = QTableWidget()
+        self.roi_table.setColumnCount(12)
+        self.roi_table.setHorizontalHeaderLabels(
+            ["", "Name", "▭/○", "⊕/⊖", "X", "Y", "W", "H",
+             "Counts", "Yield %", "Vis", "\U0001f512"]
+        )
+        hh = self.roi_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col in (2, 3, 4, 5, 6, 7, 8, 9):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(10, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(11, QHeaderView.ResizeMode.Fixed)
+        self.roi_table.setColumnWidth(0, 20)
+        self.roi_table.setColumnWidth(10, 30)
+        self.roi_table.setColumnWidth(11, 30)
+        self.roi_table.verticalHeader().setVisible(False)
+        roi_layout.addWidget(self.roi_table)
+
+        # Add ROI container as a third splitter pane (hidden until toggled)
+        self._vsplitter.addWidget(self._roi_container)
+        self._vsplitter.setStretchFactor(2, 1)
 
         self.addWidget(widget)
 
@@ -174,6 +247,9 @@ class ImageDockWidget(Dock):
 
     def _on_image_toggled(self, checked):
         self._image_container.setVisible(checked)
+
+    def _on_roi_table_toggled(self, checked):
+        self._roi_container.setVisible(checked)
 
     def _on_mouse_moved(self, scene_pos):
         """Show the pixel coordinate (and value) under the mouse cursor."""
@@ -223,3 +299,57 @@ class ImageDockWidget(Dock):
     def is_timeseries_visible(self):
         """Return True if the time series plot is currently shown."""
         return self.timeseries_check.isChecked()
+
+    # =========================================================================
+    # Spatial ROI curves — one extra curve per ROI, overlaid on timeseries_plot
+    # =========================================================================
+    def add_roi_curve(self, name, color):
+        """Add a new counts/shot curve for a spatial ROI named *name*."""
+        curve = self.timeseries_plot.plot(
+            pen=pg.mkPen(color=color[:3], width=2), name=name)
+        self._roi_curves[name] = curve
+
+    def remove_roi_curve(self, name):
+        """Remove a spatial ROI's curve."""
+        curve = self._roi_curves.pop(name, None)
+        if curve is not None:
+            self.timeseries_plot.removeItem(curve)
+            self._timeseries_legend.removeItem(name)
+
+    def update_roi_curve(self, name, times, counts):
+        """Update a spatial ROI's curve data."""
+        curve = self._roi_curves.get(name)
+        if curve is not None and len(times) > 0:
+            curve.setData(times, counts)
+
+    def set_roi_curve_visible(self, name, visible):
+        """Show/hide a spatial ROI's curve without removing it."""
+        curve = self._roi_curves.get(name)
+        if curve is not None:
+            curve.setVisible(visible)
+
+    def rename_roi_curve(self, old_name, new_name, color):
+        """Swap a curve's identity (used when a spatial ROI is renamed)."""
+        curve = self._roi_curves.pop(old_name, None)
+        if curve is not None:
+            self.timeseries_plot.removeItem(curve)
+            self._timeseries_legend.removeItem(old_name)
+        self.add_roi_curve(new_name, color)
+
+    # ── Combined-mask curve ───────────────────────────────────────────────────
+
+    def ensure_combined_curve(self):
+        """Create the 'Combined' timeseries curve if it doesn't exist yet."""
+        if "Combined" not in self._roi_curves:
+            curve = self.timeseries_plot.plot(
+                pen=pg.mkPen(color=(220, 220, 220), width=2,
+                             style=pg.QtCore.Qt.PenStyle.DashLine),
+                name="Combined",
+            )
+            self._roi_curves["Combined"] = curve
+
+    def remove_combined_curve(self):
+        self.remove_roi_curve("Combined")
+
+    def update_combined_curve(self, times, counts):
+        self.update_roi_curve("Combined", times, counts)

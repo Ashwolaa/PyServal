@@ -10,7 +10,8 @@ Protocol (JSON over ZMQ REQ/REP):
   ← {"status": "pong"}
 
   → {"cmd": "start_record", "filename": "scan_001", "output_dir": "/data",
-       "save_raw": true, "save_events": true, "save_pixels": false}
+       "save_raw": true, "save_events": true, "save_pixels": false,
+       "flat": false, "write_metadata": true, "metadata_name": null}
   ← {"status": "ok", "recording": true}
 
   → {"cmd": "stop_record"}
@@ -119,6 +120,9 @@ class CommandServer:
                 save_raw=msg.get("save_raw", True),
                 save_events=msg.get("save_events", True),
                 save_pixels=msg.get("save_pixels", False),
+                flat=msg.get("flat", False),
+                write_metadata=msg.get("write_metadata", True),
+                metadata_name=msg.get("metadata_name", None),
             )
             return {
                 "status": "ok" if success else "error",

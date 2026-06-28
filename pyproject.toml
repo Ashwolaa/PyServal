@@ -9,20 +9,34 @@ description = "TPX3 camera acquisition GUI and pipeline using the SERVAL server"
 requires-python = ">=3.9"
 
 dependencies = [
-    # Core data processing
+    # Core only: SERVAL.core.data_types, SERVAL.io (TPX3Run loader),
+    # SERVAL.postprocessing.centroiding — file formats and offline analysis,
+    # no acquisition/GUI machinery. Kept deliberately numpy-only so other
+    # packages (e.g. DATpx3) can depend on pyserval for loading without
+    # pulling in pyzmq/Qt/PyMoDAQ.
     "numpy",
+]
 
-    # Inter-process communication (ZMQ)
-    "pyzmq",
+[project.optional-dependencies]
+# JIT-compiled packet processing (strongly recommended — ~10x faster extraction)
+jit = [
+    "numba",
+]
 
-    # SERVAL HTTP REST client
-    "requests",
+# Headless live pipeline + SERVAL HTTP control, no GUI display —
+# SERVAL.core.{pipeline,tcp_receiver,chunk_assembler,command_server,workers.extractor},
+# SERVAL.controllers.serval_control (SERVALController is a QObject for its
+# signals even when run headless, hence qtpy here rather than in "gui").
+control = [
+    "pyzmq",     # inter-process communication between receiver and extractors
+    "requests",  # SERVAL HTTP REST client
+    "qtpy",      # Qt abstraction layer — bring your own PyQt5/PyQt6/PySide6
+]
 
-    # Qt abstraction layer (requires a backend: PyQt5, PyQt6, or PySide6)
-    "qtpy",
-
-    # Fast plotting widgets
-    "pyqtgraph>=0.12",
+# Acquisition GUI display widgets — SERVAL.gui.*, SERVAL.postprocessing.postprocessing_gui
+gui = [
+    "pyserval[control]",
+    "pyqtgraph>=0.12",  # fast plotting widgets
 
     # PyMoDAQ GUI components (ParameterManager, ActionManager)
     # Install locally from ./PyMoDAQ/packages/:
@@ -33,25 +47,11 @@ dependencies = [
     "pymodaq_gui",
 ]
 
-[project.optional-dependencies]
-# JIT-compiled packet processing (strongly recommended — ~10x faster extraction)
-jit = [
-    "numba",
-]
-
-# GPU-accelerated 2D histogram accumulation (requires CUDA)
-gpu = [
-    "cupy-cuda12x",
-]
-
-# Qt backends — install exactly one
-pyqt5   = ["PyQt5"]
-pyqt6   = ["PyQt6"]
-pyside6 = ["PySide6"]
-
-# Everything for a full local install (GPU excluded)
+# Everything for a full local install (GPU excluded). Does not pin a Qt
+# backend — install whichever of PyQt5/PyQt6/PySide6 you already manage
+# yourself; qtpy (pulled in by "control") picks it up automatically.
 full = [
-    "pyserval[jit,pyqt5]",
+    "pyserval[jit,gui]",
 ]
 
 dev = [
@@ -62,6 +62,9 @@ dev = [
 
 [project.scripts]
 serval-gui = "SERVAL.gui.acquisition_gui:main"
+
+[tool.hatch.build]
+packages = ["SERVAL"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["SERVAL"]

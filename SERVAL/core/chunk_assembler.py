@@ -24,7 +24,7 @@ import time
 
 import zmq
 
-from SERVAL.core.utils import find_nth_trigger_boundary
+from SERVAL.core.chunk_utils import find_nth_trigger_boundary
 from SERVAL.utils.logging import get_logger
 
 

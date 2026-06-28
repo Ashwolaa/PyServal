@@ -19,8 +19,9 @@ from SERVAL.utils.logging import get_logger
 from SERVAL.core.data_types import TDCChannel, TriggerEdge
 from SERVAL.core.extractors.parallel_processor import (
     TPX3Extractor, PixelData,
-    _correlate_pixels_jit, _correlate_pixels_parallel, _centroid_hits,
+    _correlate_pixels_jit, _correlate_pixels_parallel,
 )
+from SERVAL.postprocessing.dbscan_numba import centroid_pixels_dbscan
 from .savers import EventSaverProcess, PixelSaverProcess, TriggerSaverProcess
 
 
@@ -50,7 +51,6 @@ class ExtractorWorker(multiprocessing.Process):
         use_centroiding: bool = False,
         eps_space: int = 2,       # pixels (Manhattan distance)
         eps_time_ns: float = 100.0,  # nanoseconds
-        b_size: int = 16,
         event_queue: Optional[multiprocessing.Queue] = None,  # For correlated events (saving)
         pixel_queue: Optional[multiprocessing.Queue] = None,  # For raw pixels (saving)
         trigger_queue: Optional[multiprocessing.Queue] = None,  # For all triggers (saving)
@@ -87,7 +87,6 @@ class ExtractorWorker(multiprocessing.Process):
         self.use_centroiding = use_centroiding
         self.eps_space = eps_space
         self.eps_time = eps_time_ns * 1e-9  # convert to seconds
-        self.b_size = b_size
         self.daemon = True
         self._correlate_func = correlate_func
 
@@ -170,11 +169,30 @@ class ExtractorWorker(multiprocessing.Process):
                 pixels, triggers, _, _ = extract_fn(raw_bytes)
                 t_extract = time.perf_counter()
 
-                # Optional greedy centroiding (replaces raw pixels with centroids)
+                # Filter triggers by TDC and edge up front — needed below both
+                # for correlation and to let centroiding group pixels by shot
+                # (splitting the O(n^2) DBSCAN neighbor search into one much
+                # cheaper search per shot, since charge-sharing only ever
+                # spans nanoseconds, far less than the gap between triggers).
+                if len(triggers) > 0:
+                    if self.tdc_id == 0:
+                        _trig_mask = triggers.edge == self.edge
+                    else:
+                        _trig_mask = (triggers.tdc_id == self.tdc_id) & (triggers.edge == self.edge)
+                    trigger_times = triggers.toa[_trig_mask]
+                else:
+                    trigger_times = np.empty(0, dtype=np.float64)
+
+                # Optional DBSCAN centroiding (replaces raw pixels with centroids).
+                # Same algorithm/module as the offline centroiding tool
+                # (SERVAL.postprocessing.dbscan_numba) — see centroid_pixels_dbscan
+                # for why this adapter differs from the offline one (pre- vs.
+                # post-correlation data, never drops isolated hits as "noise").
                 if self.use_centroiding and len(pixels) > 0:
-                    cx, cy, ctoa, ctot, _ = _centroid_hits(
+                    cx, cy, ctoa, ctot, _ = centroid_pixels_dbscan(
                         pixels.x, pixels.y, pixels.toa, pixels.tot,
-                        self.eps_space, self.eps_time, self.b_size,
+                        trigger_times=trigger_times if len(trigger_times) > 1 else None,
+                        epsilon=self.eps_space, eps_time=self.eps_time, min_points=1,
                     )
                     pixels = PixelData(x=cx, y=cy, toa=ctoa, tot=ctot)
 
@@ -240,18 +258,7 @@ class ExtractorWorker(multiprocessing.Process):
                 if self.event_queue is None and self.callback_event_queue is None:
                     continue
 
-                if len(pixels) == 0 or len(triggers) == 0:
-                    continue
-
-                # Filter triggers by TDC and edge
-                if self.tdc_id == 0:
-                    mask = triggers.edge == self.edge
-                else:
-                    mask = (triggers.tdc_id == self.tdc_id) & (triggers.edge == self.edge)
-
-                trigger_times = triggers.toa[mask]
-
-                if len(trigger_times) == 0:
+                if len(pixels) == 0 or len(trigger_times) == 0:
                     continue
 
                 # JIT correlation
@@ -365,7 +372,6 @@ class ExtractorPool:
         use_centroiding: bool = False,
         eps_space: int = 2,
         eps_time_ns: float = 100.0,
-        b_size: int = 16,
         adjusted_columns: list = None,
     ):
         self.num_workers = num_workers
@@ -385,7 +391,6 @@ class ExtractorPool:
         self.use_centroiding = use_centroiding
         self.eps_space = eps_space
         self.eps_time_ns = eps_time_ns
-        self.b_size = b_size
         self.adjusted_columns = adjusted_columns or []
 
         # Merge user config with defaults
@@ -495,7 +500,6 @@ class ExtractorPool:
                 use_centroiding=self.use_centroiding,
                 eps_space=self.eps_space,
                 eps_time_ns=self.eps_time_ns,
-                b_size=self.b_size,
                 chunks_processed_counter=self.chunk_counters[i],
                 adjusted_columns=self.adjusted_columns,
             )

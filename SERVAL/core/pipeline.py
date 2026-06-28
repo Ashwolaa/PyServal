@@ -81,11 +81,10 @@ class TPX3PipelineV3:
         "edge": TriggerEdge.RISING,
         "events": True,
         "pixels": True,
-        # Greedy centroiding (applied to raw pixels before trigger correlation)
+        # DBSCAN centroiding (applied to raw pixels before trigger correlation)
         "use_centroiding": False,
-        "eps_space": 2,        # pixels, Manhattan distance
-        "eps_time_ns": 100.0,  # nanoseconds
-        "b_size": 16,          # lookback buffer depth
+        "eps_space": 2,        # pixels, spatial cluster radius
+        "eps_time_ns": 100.0,  # nanoseconds, ToA cluster radius
         # Per-column TOA correction from SERVAL chip config (GET /detector/chips/0).
         # List of double-column indices that need a -25 ns adjustment.
         # Populated by the GUI before acquisition; empty = no correction.
@@ -236,7 +235,6 @@ class TPX3PipelineV3:
             use_centroiding=ext.get("use_centroiding", False),
             eps_space=ext.get("eps_space", 2),
             eps_time_ns=ext.get("eps_time_ns", 100.0),
-            b_size=ext.get("b_size", 16),
             adjusted_columns=ext.get("adjusted_columns", []),
         )
 
@@ -282,6 +280,9 @@ class TPX3PipelineV3:
         save_events: bool = True,
         save_pixels: bool = False,
         save_triggers: bool = True,
+        flat: bool = False,
+        write_metadata: bool = True,
+        metadata_name: Optional[str] = None,
     ) -> bool:
         """
         Begin a recording session.
@@ -292,8 +293,9 @@ class TPX3PipelineV3:
         Parameters
         ----------
         filename : str
-            Run name. A subdirectory {output_dir}/{filename}/ is created and
-            all files are placed inside it: {filename}.tpx3, {filename}_events.dat, etc.
+            Run name. Unless `flat` is set, a subdirectory {output_dir}/{filename}/
+            is created and all files are placed inside it: {filename}.tpx3,
+            {filename}_events.dat, etc.
         output_dir : str, optional
             Directory for output files. Defaults to self.output_dir.
         save_raw : bool
@@ -304,6 +306,19 @@ class TPX3PipelineV3:
             Write raw pixel .dat file (requires pixels saver).
         save_triggers : bool
             Write triggers .trg file (requires triggers saver).
+        flat : bool
+            If True, write directly into output_dir instead of creating a
+            {filename}/ subdirectory. Useful for callers (e.g. the PyMoDAQ
+            plugin) that already pass a per-scan-node output_dir and want
+            files named only by step index, without an extra nesting level.
+        write_metadata : bool
+            If False, skip writing the metadata JSON file for this recording.
+            Useful for callers that record many takes sharing identical
+            pipeline config (e.g. every step of a PyMoDAQ scan) and only want
+            one metadata file for the whole batch instead of one per take.
+        metadata_name : str, optional
+            Base name for the metadata file (written as {metadata_name}_meta.json).
+            Defaults to `filename`.
 
         Returns
         -------
@@ -318,8 +333,9 @@ class TPX3PipelineV3:
             self.stop_record()
 
         base_dir = Path(output_dir) if output_dir else self.output_dir
-        # Each recording gets its own subdirectory named after the run
-        run_dir = base_dir / filename
+        # Each recording gets its own subdirectory named after the run,
+        # unless the caller opts into a flat layout.
+        run_dir = base_dir if flat else base_dir / filename
         run_dir.mkdir(parents=True, exist_ok=True)
 
         active_savers = []
@@ -385,8 +401,9 @@ class TPX3PipelineV3:
             "active_savers": active_savers,
         }
 
-        # Write metadata file
-        self._write_metadata(filename, run_dir, file_map)
+        # Write metadata file (optional — see `write_metadata` docstring)
+        if write_metadata:
+            self._write_metadata(metadata_name or filename, run_dir, file_map)
 
         self.logger.info(f"Recording started: {filename} (savers: {active_savers})")
         return True
@@ -407,7 +424,6 @@ class TPX3PipelineV3:
                 "enabled": ext.get("use_centroiding", False),
                 "eps_space_px": ext.get("eps_space", 2),
                 "eps_time_ns": ext.get("eps_time_ns", 100.0),
-                "b_size": ext.get("b_size", 16),
             },
             "column_correction": {
                 "adjusted_double_columns": ext.get("adjusted_columns", []),
@@ -949,9 +965,8 @@ def main():
             "event_window": (0.0, 300_000.0),
             "tdc_id": 1,
             "use_centroiding": True,
-            "eps_space": 2,        # pixels, Manhattan distance
-            "eps_time_ns": 100.0,  # nanoseconds
-            "b_size": 16,          # lookback buffer depth            
+            "eps_space": 2,        # pixels, spatial cluster radius
+            "eps_time_ns": 100.0,  # nanoseconds, ToA cluster radius
         },
         save_config={
             "output_dir": "./data",

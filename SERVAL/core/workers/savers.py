@@ -74,6 +74,7 @@ class BaseSaverProcess(multiprocessing.Process, ABC):
         if self._file is not None:
             if self._buffer_pos > 0:
                 self._write_buffer_to_file(self._file, self._buffer, self._buffer_pos)
+            self._buffer_pos = 0
             self._file.close()
             elapsed = time.time() - self._start_time
             rate_mb = (self._total_items * self._item_size / 1e6) / elapsed if elapsed > 0 else 0

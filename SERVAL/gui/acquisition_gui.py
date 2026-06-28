@@ -31,6 +31,7 @@ from qtpy.QtCore import QObject, Qt, QSettings, QTimer, Signal
 from qtpy.QtWidgets import (
     QActionGroup,
     QApplication,
+    QCheckBox,
     QDoubleSpinBox,
     QToolBar,
     QHBoxLayout,
@@ -46,6 +47,7 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+import re
 
 from pymodaq_gui.managers.action_manager import ActionManager
 from pymodaq_gui.managers.parameter_manager import ParameterManager
@@ -59,6 +61,8 @@ from SERVAL.gui.log_dock import LogDock
 from SERVAL.gui.pipeline_status_dock import PipelineStatusDock
 from SERVAL.gui.pipeline_thread import PipelineThread
 from SERVAL.gui.roi_manager import ROIManager
+from SERVAL.gui.spatial_roi_manager import SpatialROIManager
+from SERVAL.gui.covariance_dock import CovarianceDock
 from SERVAL.gui.tof_histogram_dock import TofHistogramDock
 from SERVAL.utils.logging import (
     add_log_handler, get_logger, remove_log_handler,
@@ -68,7 +72,26 @@ from SERVAL.utils.logging import (
 # Log a per-step timing breakdown of _update_histograms() when the total
 # exceeds this many milliseconds. Visible at DEBUG level (set_log_level('DEBUG')).
 _SLOW_REFRESH_MS = 20.0
+
+# Param paths (tuples of child names) that remain editable while acquisition is
+# running.  Add a path here when its value_changed handler is thread-safe and
+# does not require a pipeline restart to take effect.
+_LIVE_ADJUSTABLE_PARAMS: list[tuple[str, ...]] = [
+    ('pipeline', 'processing', 'covariance'),  # enable/bins — thread-safe accumulators
+]
 set_log_level('DEBUG')
+def _increment_filename(name: str) -> str:
+    """Bump the trailing run of digits in *name* by one, preserving zero-padding.
+
+    e.g. 'run_007' -> 'run_008', 'scan42' -> 'scan43', 'run' -> 'run_1'.
+    """
+    m = re.search(r'(\d+)$', name)
+    if m:
+        next_num = str(int(m.group(1)) + 1).zfill(len(m.group(1)))
+        return name[:m.start()] + next_num
+    return f'{name}_1'
+
+
 class _ServalSignaller(QObject):
     """Helper QObject for cross-thread signal delivery from the SERVAL config thread."""
     started = Signal()
@@ -176,6 +199,15 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 {'title': 'Event Window Max (ns)', 'name': 'event_window_max', 'type': 'float',
                  'value': 100000.0,
                  'tip': 'Maximum TOF for a pixel to be correlated to a trigger (ns)'},
+                {'title': 'Covariance Map', 'name': 'covariance', 'type': 'group', 'children': [
+                    {'title': 'Enable', 'name': 'cov_enabled', 'type': 'bool', 'value': False,
+                     'tip': ('Accumulate per-shot covariance map. '
+                             'Requires trigger-correlated events (not pixel mode). '
+                             'C(m1,m2) = <n(m1)·n(m2)> - <n(m1)>·<n(m2)>')},
+                    {'title': 'Bins', 'name': 'cov_bins', 'type': 'int', 'value': 200,
+                     'limits': (50, 2000),
+                     'tip': 'Number of TOF bins along each axis of the covariance map'},
+                ]},
                 {'title': 'Centroiding', 'name': 'centroiding', 'type': 'group', 'children': [
                     {'title': 'Enable', 'name': 'use_centroiding', 'type': 'bool', 'value': False,
                      'tip': 'Cluster neighbouring pixel hits into single events (reduces charge sharing artefacts)'},
@@ -185,9 +217,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                     {'title': 'Time eps (ns)', 'name': 'eps_time_ns', 'type': 'float',
                      'value': 100.0, 'limits': (1.0, 10000.0), 'step': 1.0, 'decimals': 0,
                      'tip': 'Maximum time difference between hits in the same cluster (ns)'},
-                    {'title': 'Buffer depth', 'name': 'b_size', 'type': 'int',
-                     'value': 16, 'limits': (4, 128),
-                     'tip': 'Number of hits buffered per worker for cluster search'},
                 ]},
                 {'title': 'Advanced', 'name': 'advanced', 'type': 'group', 'children': [
                     {'title': 'ZMQ Port', 'name': 'zmq_port', 'type': 'int', 'value': 9200,
@@ -260,6 +289,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.is_acquiring = False
         self._is_recording = False
         self._record_start_time = None  # time.monotonic() when recording started
+        self._last_record_filename = None  # filename used for the previous recording
         self._display_mode = 'events'   # 'events' (TOF) | 'pixels' (TOA)
         self._lag_ms = None  # end-to-end latency (extraction -> GUI), updated per batch
 
@@ -300,7 +330,17 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     # ParameterManager hook
     # =========================================================================
     def value_changed(self, param):
-        pass
+        name = param.name()
+        if name == 'cov_enabled':
+            self.histogram.enable_covariance(param.value())
+            if param.value():
+                self._cov_dock.show()
+                self.get_action('show_covariance').setChecked(True)
+            else:
+                self._cov_dock.hide()
+                self.get_action('show_covariance').setChecked(False)
+        elif name == 'cov_bins':
+            self.histogram.set_covariance_config(bins=param.value())
 
     # =========================================================================
     # Display parameter — convenience property
@@ -361,6 +401,10 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                         tip='Show/hide pipeline status panel (queues & workers)',
                         checkable=True, auto_toolbar=False,
                         icon_checked_color='green')
+        self.add_action('show_covariance', 'Covariance', 'grid_on',
+                        tip='Show/hide the per-shot covariance map dock',
+                        checkable=True, auto_toolbar=False,
+                        icon_checked_color='green')
         self.add_action('quit', 'Quit', 'close',
                         tip='Close the application',
                         auto_toolbar=False)
@@ -382,6 +426,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         tb.addAction(self.get_action('show_recording'))
         tb.addAction(self.get_action('show_log'))
         tb.addAction(self.get_action('show_pipeline_status'))
+        tb.addAction(self.get_action('show_covariance'))
         tb.addSeparator()
         tb.addAction(self.get_action('quit'))
 
@@ -408,6 +453,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             lambda v: self.log_dock.show() if v else self.log_dock.hide())
         self.get_action('show_pipeline_status').connect_to(
             lambda v: self._status_dock.show() if v else self._status_dock.hide())
+        self.get_action('show_covariance').connect_to(
+            lambda v: self._cov_dock.show() if v else self._cov_dock.hide())
         self.get_action('quit').connect_to(lambda: self.close())
 
     # ── Toolbar style ─────────────────────────────────────────────────────────
@@ -467,9 +514,15 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.dock_area.addDock(self.tof_dock, 'right', self._settings_dock)
 
         # Right: Total 2D image
-        self.total_dock = ImageDockWidget("Total")
+        self.total_dock = ImageDockWidget("Total", closable=False)
         self.total_dock.timeseries_check.setChecked(True)
         self.dock_area.addDock(self.total_dock, 'right', self.tof_dock)
+        self.total_roi_manager = SpatialROIManager("", self.total_dock, self)
+
+        # Covariance map (hidden by default, tabbed with total_dock)
+        self._cov_dock = CovarianceDock()
+        self.dock_area.addDock(self._cov_dock, 'above', self.total_dock)
+        self._cov_dock.hide()
 
         # Bottom: Log (hidden by default)
         self.log_dock = LogDock()
@@ -514,6 +567,12 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.record_filename_edit.setToolTip("Save filename (no extension)")
         self.record_filename_edit.setMinimumWidth(160)
         tb.addWidget(self.record_filename_edit)
+
+        self.auto_increment_check = QCheckBox("Auto-increment")
+        self.auto_increment_check.setToolTip(
+            "After a recording finishes, prefill the next name by incrementing "
+            "its trailing number (e.g. run_007 -> run_008)")
+        tb.addWidget(self.auto_increment_check)
 
         tb.addWidget(QLabel("  Duration (s):"))
         self.save_duration_spin = QDoubleSpinBox()
@@ -576,6 +635,38 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.roi_manager.roi_removed.connect(self.histogram.remove_roi)
         self.roi_manager.roi_changed.connect(self.histogram.update_roi)
 
+        # Spatial ROIs on the Total dock's own image
+        self.total_roi_manager.roi_added.connect(self.histogram.add_spatial_roi)
+        self.total_roi_manager.roi_removed.connect(self.histogram.remove_spatial_roi)
+        self.total_roi_manager.roi_changed.connect(self.histogram.update_spatial_roi)
+
+        # Spatial ROI TOF overlay curves in the TOF dock
+        self.total_roi_manager.roi_added.connect(self._on_total_spatial_roi_added)
+        self.total_roi_manager.roi_removed.connect(self._on_total_spatial_roi_removed)
+
+        # Spatial ROIs nested inside each TOF-ROI's own dock
+        self.roi_manager.spatial_roi_added.connect(self.histogram.add_spatial_roi)
+        self.roi_manager.spatial_roi_removed.connect(self.histogram.remove_spatial_roi)
+        self.roi_manager.spatial_roi_changed.connect(self.histogram.update_spatial_roi)
+        self.roi_manager.spatial_rois_cleared.connect(self.histogram.remove_spatial_rois_for_parent)
+
+    # =========================================================================
+    # Spatial-ROI TOF overlay handlers
+    # =========================================================================
+    def _on_total_spatial_roi_added(self, parent, name, shape, op, x, y, w, h):
+        if parent != "":
+            return
+        color = self.total_roi_manager.get_roi_color(name)
+        if color is not None:
+            self.tof_dock.add_spatial_tof_curve(name, color)
+
+    def _on_total_spatial_roi_removed(self, parent, name):
+        if parent != "":
+            return
+        self.tof_dock.remove_spatial_tof_curve(name)
+        if not self.total_roi_manager.get_roi_names():
+            self.tof_dock.remove_combined_tof_curve()
+
     # =========================================================================
     # Display parameter changes
     # =========================================================================
@@ -603,6 +694,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     def _on_clear_all(self):
         self.histogram.clear()
         self.histogram.clear_timeseries()
+        self._cov_dock.clear()
         self._update_histograms()
         self._log("Histograms and time series cleared")
 
@@ -619,15 +711,16 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
 
     def _on_mass_calib_changed(self):
         calib = self.display.child('mass_calib')
-        self.histogram.set_mass_calibration(
-            calib.child('coeff').value(),
-            calib.child('t0').value(),
-            enabled=calib.child('enabled').value(),
-        )
+        coeff   = calib.child('coeff').value()
+        t0      = calib.child('t0').value()
+        enabled = calib.child('enabled').value()
+        self.histogram.set_mass_calibration(coeff, t0, enabled=enabled)
         self.histogram.set_mass_config(
             mass_range=(calib.child('mass_min').value(), calib.child('mass_max').value()),
             mass_bins=calib.child('mass_bins').value(),
         )
+        self.roi_manager.update_mass_calibration(coeff, t0, enabled)
+        self._cov_dock.set_axis_label("m/z" if enabled else "TOF (ns)")
         self._apply_display_mode(self._display_mode)
         self._update_histograms()
 
@@ -747,7 +840,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             'use_centroiding':  c['use_centroiding'],
             'eps_space':        c['eps_space'],
             'eps_time_ns':      c['eps_time_ns'],
-            'b_size':           c['b_size'],
             'zmq_port':         adv['zmq_port'],
             'zmq_hwm':          adv['zmq_hwm'],
             # Column correction — populated by _start_acquisition from SERVAL chip config
@@ -947,6 +1039,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 save_triggers=p['save_triggers'],
             )
             if ok:
+                self._last_record_filename = filename
                 self._is_recording = True
                 self._record_start_time = time.monotonic()
                 self._set_record_btn_state(True)
@@ -970,10 +1063,20 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.record_time_label.setText("")
         self._set_record_btn_state(False)
         self._set_led(self.led_recording, False)
-        self.record_filename_edit.clear()
+        self._prefill_next_record_filename()
         self.record_filename_edit.setEnabled(True)
         self.save_duration_spin.setEnabled(True)
         self._log("Recording stopped")
+
+    def _prefill_next_record_filename(self):
+        """After a recording finishes, either clear the name field or, if
+        auto-increment is enabled, prefill it with the previous name's
+        trailing number bumped by one."""
+        if self.auto_increment_check.isChecked() and self._last_record_filename:
+            self.record_filename_edit.setText(
+                _increment_filename(self._last_record_filename))
+        else:
+            self.record_filename_edit.clear()
 
     def _on_stop_clicked(self):
         if not self.is_acquiring:
@@ -1001,7 +1104,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self._set_record_btn_state(False)
         self._set_led(self.led_acquiring, False)
         self._set_led(self.led_recording, False)
-        self.record_filename_edit.clear()
+        self._prefill_next_record_filename()
         self.record_filename_edit.setEnabled(True)
         self.save_duration_spin.setEnabled(True)
         self._set_pipeline_controls_enabled(True)
@@ -1028,6 +1131,15 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self._set_group_enabled(
             self.settings.child('serval', 'serval_destination'), enabled)
         self.get_action('run').setChecked(not enabled)
+
+        # When locking (enabled=False), restore live-adjustable params so they
+        # remain interactive during acquisition without a pipeline restart.
+        if not enabled:
+            for path in _LIVE_ADJUSTABLE_PARAMS:
+                try:
+                    self._set_group_enabled(self.settings.child(*path), True)
+                except Exception:
+                    pass
 
     # =========================================================================
     # Data Handlers
@@ -1061,6 +1173,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         t_image = time.perf_counter()
 
         self.roi_manager.update_displays(self.histogram, total_counts)
+        self.total_roi_manager.update_displays(self.histogram, total_counts)
         t_roi = time.perf_counter()
 
         if self.histogram.is_mass_calibration_enabled():
@@ -1068,6 +1181,27 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         else:
             tof_centers, tof_counts = self.histogram.get_tof_histogram()
         self.tof_dock.update_tof(tof_centers, tof_counts)
+
+        # Update spatially-filtered TOF overlay curves
+        mass_mode = self.histogram.is_mass_calibration_enabled()
+        spatial_names = self.total_roi_manager.get_roi_names()
+        for name in spatial_names:
+            centers, counts = self.histogram.get_spatial_roi_tof("", name)
+            if mass_mode:
+                calib = self.display.child('mass_calib')
+                coeff = calib.child('coeff').value() or 1.0
+                t0    = calib.child('t0').value()
+                centers = np.clip((centers - t0) / coeff, 0.0, None) ** 2
+            self.tof_dock.update_spatial_tof_curve(name, centers, counts)
+        if spatial_names:
+            centers, counts = self.histogram.get_combined_tof("")
+            if mass_mode:
+                calib = self.display.child('mass_calib')
+                coeff = calib.child('coeff').value() or 1.0
+                t0    = calib.child('t0').value()
+                centers = np.clip((centers - t0) / coeff, 0.0, None) ** 2
+            self.tof_dock.update_combined_tof_curve(centers, counts)
+
         t_tof = time.perf_counter()
 
         stats = self.histogram.get_stats()
@@ -1080,6 +1214,18 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             h, rem = divmod(elapsed, 3600)
             m, s = divmod(rem, 60)
             self.record_time_label.setText(f"● Rec {h:02d}:{m:02d}:{s:02d}")
+
+        if self.settings.child('pipeline', 'processing', 'covariance', 'cov_enabled').value():
+            centers_ns, cov, corr, n_shots = self.histogram.get_covariance_map()
+            if self.histogram.is_mass_calibration_enabled():
+                calib = self.display.child('mass_calib')
+                coeff = calib.child('coeff').value() or 1.0
+                t0    = calib.child('t0').value()
+                centers = np.clip((centers_ns - t0) / coeff, 0, None) ** 2
+            else:
+                centers = centers_ns
+            self._cov_dock.update_map(centers, cov, corr, n_shots)
+        t_cov = time.perf_counter()
 
         self._update_pipeline_status()
         t_status = time.perf_counter()
@@ -1099,7 +1245,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 f"image {(t_image - t_timeseries) * 1000:.1f}, "
                 f"roi {(t_roi - t_image) * 1000:.1f}, "
                 f"tof {(t_tof - t_roi) * 1000:.1f}, "
-                f"status {(t_status - t_tof) * 1000:.1f})")
+                f"cov {(t_cov - t_tof) * 1000:.1f}, "
+                f"status {(t_status - t_cov) * 1000:.1f})")
 
     # =========================================================================
     # Session persistence

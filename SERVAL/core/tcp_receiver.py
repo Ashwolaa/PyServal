@@ -6,7 +6,7 @@ Handles TCP socket management, connection accept/disconnect,
 and data receiving with ring buffers.
 """
 import numpy as np
-from SERVAL.core.utils import find_last_pattern
+from SERVAL.core.chunk_utils import find_last_pattern
 
 import socket
 import struct
@@ -77,6 +77,16 @@ class TCPReceiver:
 
         # Ring buffers
         buffer_size = int(1.5 * chunk_size)
+        # recv_into() always asks for recv_buffer_size bytes; the destination
+        # slice (buffer_size - bytes_already_filled) must stay >= that for the
+        # whole time a ring buffer is being filled, otherwise recv_into raises
+        # "buffer too small for requested bytes" right as a buffer nears full.
+        if recv_buffer_size > buffer_size:
+            raise ValueError(
+                f"recv_buffer_size ({recv_buffer_size:,} B) must not exceed "
+                f"the ring buffer size (1.5 * chunk_size = {buffer_size:,} B); "
+                f"increase chunk_size or shrink recv_buffer_size."
+            )
         self.ring_buffers = [bytearray(buffer_size) for _ in range(num_ring_buffers)]
         self.ring_buffer_views = [memoryview(buf) for buf in self.ring_buffers]
         self.ring_buffer_index = 0

@@ -14,11 +14,10 @@ The diagonal C(m, m) = Var(n(m)) is the per-bin variance.
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.dockarea import Dock
-from qtpy.QtCore import QSize
+from qtpy.QtCore import QSize, Qt, Signal
 from qtpy.QtGui import QTransform
 from qtpy.QtWidgets import (
     QAction,
-    QCheckBox,
     QHBoxLayout,
     QLabel,
     QSizePolicy,
@@ -45,6 +44,8 @@ def _make_diverging_cmap():
 class CovarianceDock(Dock):
     """Dock widget displaying the 2D per-shot covariance (or correlation) map."""
 
+    clear_requested = Signal()
+
     def __init__(self, parent=None):
         super().__init__("Covariance Map", closable=False, size=(500, 500))
 
@@ -53,7 +54,7 @@ class CovarianceDock(Dock):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
-        # ── Toolbar ───────────────────────────────────────────────────────────
+        # ── Toolbar: N shots | coord | spacer | Hide diag | Raw corr | sep | Clear
         tb = QToolBar()
         tb.setIconSize(QSize(18, 18))
         tb.setMovable(False)
@@ -62,31 +63,50 @@ class CovarianceDock(Dock):
         self._shots_label.setStyleSheet("font-family: monospace;")
         tb.addWidget(self._shots_label)
 
+        self.coord_label = QLabel("")
+        self.coord_label.setStyleSheet("color: gray;")
+        self.coord_label.setMinimumWidth(150)
+        tb.addWidget(self.coord_label)
+
         _spacer = QWidget()
         _spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(_spacer)
 
-        self._mask_diag = QCheckBox("Hide diagonal")
+        self._mask_diag = QAction('Hide diagonal', self)
+        self._mask_diag.setCheckable(True)
+        self._mask_diag.setChecked(False)
         self._mask_diag.setToolTip(
             "Zero the diagonal (per-bin variance) to reveal weaker off-diagonal "
             "covariance features without colour-scale saturation")
-        self._mask_diag.setChecked(False)
-        tb.addWidget(self._mask_diag)
+        tb.addAction(self._mask_diag)
+        tb.widgetForAction(self._mask_diag).setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly)
 
-        self._show_corr = QCheckBox("Raw correlation")
+        self._show_corr = QAction('Raw correlation', self)
+        self._show_corr.setCheckable(True)
+        self._show_corr.setChecked(False)
         self._show_corr.setToolTip(
             "Show <n(m1)·n(m2)> instead of the background-subtracted covariance")
-        self._show_corr.setChecked(False)
-        tb.addWidget(self._show_corr)
+        tb.addAction(self._show_corr)
+        tb.widgetForAction(self._show_corr).setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly)
 
         self._lock_levels = QAction(
             create_icon('lock', icon_color='orange', icon_checked_color='green'),
-            'Lock Levels', self,
+            'Lock Levels', self
         )
         self._lock_levels.setCheckable(True)
         self._lock_levels.setChecked(False)
-        self._lock_levels.setToolTip("Lock colour-bar levels (stop auto-rescaling)")
+        self._lock_levels.setToolTip(
+            "Lock the colorbar levels so they don't auto-rescale on every update")
         tb.addAction(self._lock_levels)
+
+        tb.addSeparator()
+
+        clear_action = QAction(create_icon('ink_eraser'), 'Clear', self)
+        clear_action.setToolTip("Clear the covariance map")
+        clear_action.triggered.connect(self.clear_requested)
+        tb.addAction(clear_action)
 
         layout.addWidget(tb)
 
@@ -96,6 +116,7 @@ class CovarianceDock(Dock):
         self.plot.setLabel('left', 'TOF (ns)')
         self.plot.setAspectLocked(True)
         self.plot.showGrid(x=True, y=True, alpha=0.2)
+        self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
 
         self.image = pg.ImageItem()
         self.plot.addItem(self.image)
@@ -116,6 +137,15 @@ class CovarianceDock(Dock):
 
         layout.addWidget(image_row)
         self.addWidget(widget)
+
+    # ── Internal handlers ─────────────────────────────────────────────────────
+
+    def _on_mouse_moved(self, scene_pos):
+        if not self.plot.sceneBoundingRect().contains(scene_pos):
+            self.coord_label.setText("")
+            return
+        view_pos = self.plot.getPlotItem().vb.mapSceneToView(scene_pos)
+        self.coord_label.setText(f"x={view_pos.x():.1f}, y={view_pos.y():.1f}")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -147,10 +177,10 @@ class CovarianceDock(Dock):
         tr.scale(step, step)
         self.image.setTransform(tr)
 
-        auto = not self._lock_levels.isChecked()
+        locked = self._lock_levels.isChecked()
         # Transpose: pyqtgraph ImageItem has x along columns, y along rows.
-        self.image.setImage(display.T, autoLevels=auto)
-        if auto and not self._show_corr.isChecked():
+        self.image.setImage(display.T, autoLevels=not locked)
+        if not locked and not self._show_corr.isChecked():
             vmax = np.abs(display).max()
             if vmax > 0:
                 self.image.setLevels([-vmax, vmax])

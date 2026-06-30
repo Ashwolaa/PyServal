@@ -44,6 +44,8 @@ class ROIManager(BaseROIManager):
     roi_added = Signal(str, float, float)    # name, min_ns, max_ns
     roi_removed = Signal(str)                # name
     roi_changed = Signal(str, float, float)  # name, min_ns, max_ns
+    clear_requested = Signal()               # re-emitted from any ROI dock's Clear button
+    dock_created = Signal(object)            # emitted when a new ImageDockWidget is added
 
     # Forwarded from each TOF ROI's own SpatialROIManager
     spatial_roi_added = Signal(str, str, str, str, int, int, int, int)  # parent,name,shape,op,x,y,w,h
@@ -81,6 +83,11 @@ class ROIManager(BaseROIManager):
     @property
     def _table(self) -> QTableWidget:
         return self._roi_table
+
+    @property
+    def docks(self) -> list:
+        """Return the ImageDockWidget for every live TOF ROI."""
+        return [r["dock"] for r in self._rois.values()]
 
     def _pg_item(self, name: str):
         return self._rois[name]["region"]
@@ -179,6 +186,7 @@ class ROIManager(BaseROIManager):
 
         dock = ImageDockWidget(name, color=color)
         dock.sigClosed.connect(lambda _d, n=name: self._on_dock_closed(n))
+        dock.clear_requested.connect(self.clear_requested)
 
         if self._rois:
             self._dockarea.addDock(dock, 'above', list(self._rois.values())[-1]["dock"])
@@ -195,6 +203,7 @@ class ROIManager(BaseROIManager):
                             "spatial_manager": spatial_manager,
                             "tof_min_ns": tof_min_ns, "tof_max_ns": tof_max_ns}
 
+        self.dock_created.emit(dock)
         self._refresh_table()
         self.roi_added.emit(name, tof_min_ns, tof_max_ns)
 

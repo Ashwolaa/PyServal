@@ -76,9 +76,7 @@ _SLOW_REFRESH_MS = 20.0
 # Param paths (tuples of child names) that remain editable while acquisition is
 # running.  Add a path here when its value_changed handler is thread-safe and
 # does not require a pipeline restart to take effect.
-_LIVE_ADJUSTABLE_PARAMS: list[tuple[str, ...]] = [
-    ('pipeline', 'processing', 'covariance'),  # enable/bins — thread-safe accumulators
-]
+_LIVE_ADJUSTABLE_PARAMS: list[tuple[str, ...]] = []
 set_log_level('DEBUG')
 def _increment_filename(name: str) -> str:
     """Bump the trailing run of digits in *name* by one, preserving zero-padding.
@@ -130,23 +128,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                  'tip': 'IP address of this machine as seen from the SERVAL server'},
                 {'title': 'Dest. Port', 'name': 'dest_port', 'type': 'int', 'value': 8088,
                  'limits': (1, 65535), 'tip': 'TCP port on which the pipeline listens for incoming data'},
-                {'title': 'Advanced', 'name': 'advanced', 'type': 'group', 'children': [
-                    {'title': 'Triggers / Chunk', 'name': 'triggers_per_chunk', 'type': 'int',
-                     'value': 100, 'limits': (0, 100_000),
-                     'tip': ('Flush to workers every N rising edges of the selected TDC. '
-                             'Each worker chunk is then guaranteed to contain exactly N '
-                             'complete laser shots with no cross-chunk orphaned pixels. '
-                             '0 = disabled, use chunk size / timeout only.')},
-                    {'title': 'Chunk Size (B)', 'name': 'chunk_size', 'type': 'int',
-                     'value': 10_000_000, 'limits': (100_000, 100_000_000),
-                     'tip': 'Fallback: flush after this many bytes when trigger-aligned flushing is disabled or not enough triggers have arrived yet'},
-                    {'title': 'Flush Timeout (s)', 'name': 'flush_timeout', 'type': 'float',
-                     'value': 0.3, 'limits': (0.01, 5.0),
-                     'tip': 'Force flush after this many seconds even if chunk size / trigger count not reached'},
-                    {'title': 'Recv Buffer (MB)', 'name': 'recv_buffer_mb', 'type': 'int',
-                     'value': 2, 'limits': (1, 512),
-                     'tip': 'OS-level TCP receive buffer size — increase if seeing dropped chunks at high rates'},
-                ]},
             ]},
             {'title': 'Voltage', 'name': 'voltage_settings', 'type': 'action_led', 'children': [
                 {'title': 'Bias Voltage (V)', 'name': 'bias_voltage', 'type': 'int',
@@ -179,14 +160,9 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                  'tip': 'Active acquisition window per trigger (AUTOTRIGSTART_TIMERSTOP mode only)'},
             ]},
         ]},
-        {'title': 'Pipeline', 'name': 'pipeline', 'type': 'group', 'children': [
-            {'title': 'Processing', 'name': 'processing', 'type': 'group', 'children': [
-                {'title': 'Workers', 'name': 'num_workers', 'type': 'int', 'value': 4,
-                 'limits': (1, 16),
-                 'tip': 'Number of parallel extractor processes. Match to available CPU cores.'},
-                {'title': 'Fast Extract', 'name': 'use_fast_extract', 'type': 'bool',
-                 'value': True,
-                 'tip': 'Use optimised (Numba JIT) extraction path. Disable only for debugging.'},
+        {'title': 'Acquisition', 'name': 'pipeline', 'type': 'group',
+         'tip': 'Pipeline configuration — locked while acquisition is running', 'children': [
+            {'title': 'Correlation', 'name': 'correlation', 'type': 'group', 'children': [
                 {'title': 'TDC', 'name': 'tdc_id', 'type': 'list',
                  'limits': TDCChannel.labels(), 'value': TDCChannel.TDC1.label,
                  'tip': 'TDC channel carrying the trigger signal used for TOF correlation'},
@@ -199,15 +175,14 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 {'title': 'Event Window Max (ns)', 'name': 'event_window_max', 'type': 'float',
                  'value': 100000.0,
                  'tip': 'Maximum TOF for a pixel to be correlated to a trigger (ns)'},
-                {'title': 'Covariance Map', 'name': 'covariance', 'type': 'group', 'children': [
-                    {'title': 'Enable', 'name': 'cov_enabled', 'type': 'bool', 'value': False,
-                     'tip': ('Accumulate per-shot covariance map. '
-                             'Requires trigger-correlated events (not pixel mode). '
-                             'C(m1,m2) = <n(m1)·n(m2)> - <n(m1)>·<n(m2)>')},
-                    {'title': 'Bins', 'name': 'cov_bins', 'type': 'int', 'value': 200,
-                     'limits': (50, 2000),
-                     'tip': 'Number of TOF bins along each axis of the covariance map'},
-                ]},
+            ]},
+            {'title': 'Extraction', 'name': 'processing', 'type': 'group', 'children': [
+                {'title': 'Workers', 'name': 'num_workers', 'type': 'int', 'value': 4,
+                 'limits': (1, 16),
+                 'tip': 'Number of parallel extractor processes. Match to available CPU cores.'},
+                {'title': 'Fast Extract', 'name': 'use_fast_extract', 'type': 'bool',
+                 'value': True,
+                 'tip': 'Use optimised (Numba JIT) extraction path. Disable only for debugging.'},
                 {'title': 'Centroiding', 'name': 'centroiding', 'type': 'group', 'children': [
                     {'title': 'Enable', 'name': 'use_centroiding', 'type': 'bool', 'value': False,
                      'tip': 'Cluster neighbouring pixel hits into single events (reduces charge sharing artefacts)'},
@@ -225,6 +200,21 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                     {'title': 'ZMQ HWM', 'name': 'zmq_hwm', 'type': 'int', 'value': 1000,
                      'limits': (10, 100000),
                      'tip': 'ZMQ high-water mark — max queued messages before chunks are dropped'},
+                    {'title': 'Triggers / Chunk', 'name': 'triggers_per_chunk', 'type': 'int',
+                     'value': 100, 'limits': (0, 100_000),
+                     'tip': ('Flush to workers every N rising edges of the selected TDC. '
+                             'Each worker chunk is then guaranteed to contain exactly N '
+                             'complete laser shots with no cross-chunk orphaned pixels. '
+                             '0 = disabled, use chunk size / timeout only.')},
+                    {'title': 'Chunk Size (B)', 'name': 'chunk_size', 'type': 'int',
+                     'value': 10_000_000, 'limits': (100_000, 100_000_000),
+                     'tip': 'Fallback: flush after this many bytes when trigger-aligned flushing is disabled or not enough triggers have arrived yet'},
+                    {'title': 'Flush Timeout (s)', 'name': 'flush_timeout', 'type': 'float',
+                     'value': 0.3, 'limits': (0.01, 5.0),
+                     'tip': 'Force flush after this many seconds even if chunk size / trigger count not reached'},
+                    {'title': 'Recv Buffer (MB)', 'name': 'recv_buffer_mb', 'type': 'int',
+                     'value': 2, 'limits': (1, 512),
+                     'tip': 'OS-level TCP receive buffer size — increase if seeing dropped chunks at high rates'},
                 ]},
             ]},
             {'title': 'Saving', 'name': 'saving', 'type': 'group', 'children': [
@@ -254,10 +244,12 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                      'tip': 'Number of parallel processes writing trigger data'},
                 ]},
             ]},
-            {'title': 'Live', 'name': 'live', 'type': 'group', 'children': [
+            {'title': 'Live Feed', 'name': 'live', 'type': 'group', 'children': [
                 {'title': 'Callback Mode', 'name': 'callback_mode', 'type': 'list',
                  'limits': ['events', 'pixels', 'disabled'], 'value': 'events',
                  'tip': 'What data the pipeline sends to the GUI for live display. Disable to reduce overhead.'},
+            ]},
+            {'title': 'External Control', 'name': 'external_control', 'type': 'group', 'children': [
                 {'title': 'Command Server', 'name': 'command_server', 'type': 'group', 'children': [
                     {'title': 'Enable', 'name': 'cmd_enabled', 'type': 'bool', 'value': True,
                      'tip': 'Enable ZMQ command server for external control (e.g. from PyMoDAQ)'},
@@ -265,6 +257,39 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                      'limits': (1024, 65535),
                      'tip': 'ZMQ port for the command server'},
                 ]},
+            ]},
+        ]},
+        {'title': 'Display', 'name': 'display_settings', 'type': 'group', 'children': [
+            {'title': 'Live Feed', 'name': 'live_feed', 'type': 'group', 'children': [
+                {'title': 'Refresh Rate (s)', 'name': 'refresh_rate_s', 'type': 'float',
+                 'value': 1.0, 'limits': (0.1, 60.0),
+                 'tip': 'How often the histograms and images are redrawn (seconds)'},
+                {'title': 'Live Subsampling (%)', 'name': 'display_fraction', 'type': 'float',
+                 'value': 100.0, 'limits': (1.0, 100.0), 'step': 5.0, 'decimals': 0,
+                 'tip': ('Percentage of incoming events/pixels fed to the live display. '
+                         'Subsampling happens in the extractor workers before data is sent to the GUI, '
+                         'so reducing this also lowers display lag at high rates. '
+                         'Saving to disk is always full-resolution and unaffected.')},
+                {'title': 'Auto-clear (s, -1=off)', 'name': 'clear_interval', 'type': 'float',
+                 'value': -1.0, 'limits': (-1.0, 3600.0),
+                 'tip': 'Automatically clear histogram every N seconds during acquisition. -1 disables.'},
+                {'title': 'Time Window (s, -1=all)', 'name': 'max_time_window_s', 'type': 'float',
+                 'value': -1.0, 'limits': (-1.0, 3600.0),
+                 'tip': 'How many seconds of history the timeseries plots show. -1 = show all.'},
+            ]},
+            {'title': 'Appearance', 'name': 'appearance', 'type': 'group', 'children': [
+                {'title': 'Colormap', 'name': 'colormap', 'type': 'list',
+                 'limits': ['viridis', 'plasma', 'inferno', 'magma', 'thermal'],
+                 'value': 'viridis', 'tip': 'Colour scale for the 2D pixel images'},
+            ]},
+            {'title': 'Covariance Map', 'name': 'covariance', 'type': 'group', 'children': [
+                {'title': 'Enable', 'name': 'cov_enabled', 'type': 'bool', 'value': False,
+                 'tip': ('Accumulate per-shot covariance map. '
+                         'Requires trigger-correlated events (not pixel mode). '
+                         'C(m1,m2) = <n(m1)·n(m2)> - <n(m1)>·<n(m2)>')},
+                {'title': 'Bins', 'name': 'cov_bins', 'type': 'int', 'value': 200,
+                 'limits': (50, 2000),
+                 'tip': 'Number of TOF bins along each axis of the covariance map'},
             ]},
         ]},
     ]
@@ -341,6 +366,21 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 self.get_action('show_covariance').setChecked(False)
         elif name == 'cov_bins':
             self.histogram.set_covariance_config(bins=param.value())
+        elif name == 'refresh_rate_s':
+            if self.is_acquiring:
+                self.refresh_timer.start(int(param.value() * 1000))
+        elif name == 'clear_interval':
+            if self.is_acquiring and param.value() > 0:
+                self._last_clear_time = time.time()
+        elif name == 'colormap':
+            self._on_colormap_changed(param.value())
+        elif name == 'display_fraction':
+            frac = param.value() / 100.0
+            self.histogram.set_display_fraction(frac)
+            if self.pipeline_thread is not None:
+                self.pipeline_thread.set_display_fraction(frac)
+        elif name == 'max_time_window_s':
+            self._apply_timeseries_window(param.value())
 
     # =========================================================================
     # Display parameter — convenience property
@@ -515,7 +555,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
 
         # Right: Total 2D image
         self.total_dock = ImageDockWidget("Total", closable=False)
-        self.total_dock.timeseries_check.setChecked(True)
         self.dock_area.addDock(self.total_dock, 'right', self.tof_dock)
         self.total_roi_manager = SpatialROIManager("", self.total_dock, self)
 
@@ -618,8 +657,12 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.serval.disconnected.connect(self._on_serval_disconnected)
         self.serval.error_occurred.connect(self._on_serval_error)
 
-        # TOF histogram dock
+        # Viewer dock Clear buttons — all route to the same full reset
         self.tof_dock.clear_requested.connect(self._on_clear_all)
+        self.total_dock.clear_requested.connect(self._on_clear_all)
+        self._cov_dock.clear_requested.connect(self._on_clear_all)
+        self.roi_manager.clear_requested.connect(self._on_clear_all)
+        self.roi_manager.dock_created.connect(self._on_roi_dock_created)
         self.tof_dock.display.sigTreeStateChanged.connect(self._on_display_param_changed)
 
         # ROI dock mini-toolbar → ROIManager
@@ -673,21 +716,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     def _on_display_param_changed(self, _root, changes):
         for param, _change, _data in changes:
             name = param.name()
-            if name == 'refresh_rate_s':
-                if self.is_acquiring:
-                    self.refresh_timer.start(int(param.value() * 1000))
-            elif name == 'clear_interval':
-                if self.is_acquiring and param.value() > 0:
-                    self._last_clear_time = time.time()
-            elif name == 'colormap':
-                self._on_colormap_changed(param.value())
-            elif name in ('tof_bins', 'tof_min_ns', 'tof_max_ns'):
+            if name in ('tof_bins', 'tof_min_ns', 'tof_max_ns'):
                 self._on_tof_config_changed()
-            elif name == 'display_fraction':
-                frac = param.value() / 100.0
-                self.histogram.set_display_fraction(frac)
-                if self.pipeline_thread is not None:
-                    self.pipeline_thread.set_display_fraction(frac)
             elif param.parent() is not None and param.parent().name() == 'mass_calib':
                 self._on_mass_calib_changed()
 
@@ -697,6 +727,17 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self._cov_dock.clear()
         self._update_histograms()
         self._log("Histograms and time series cleared")
+
+    def _on_roi_dock_created(self, dock):
+        """Apply current display settings to a newly created ROI dock."""
+        max_s = self.settings.child(
+            'display_settings', 'live_feed', 'max_time_window_s').value()
+        dock.set_time_window(max_s)
+
+    def _apply_timeseries_window(self, max_s: float):
+        """Push a trailing time-window to every counts/shot timeseries plot."""
+        for dock in [self.total_dock] + self.roi_manager.docks:
+            dock.set_time_window(max_s)
 
     def _on_colormap_changed(self, name: str):
         self.total_dock.set_colormap(name)
@@ -731,15 +772,18 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         if mode == 'pixels':
             base_title, base_units = "Time of Arrival (TOA)", "TOA (ns)"
             ts_label = "Counts/Refresh"
+            curve_label = "TOA"
         else:
             base_title, base_units = "Time of Flight (TOF)", "TOF (ns)"
             ts_label = "Counts/Shot"
+            curve_label = "m/z (all)" if mass_mode else "TOF (all)"
         if mass_mode:
             self.tof_dock.set_plot_title(f"{base_title} → Mass (calibrated)")
             self.tof_dock.set_x_label("m/z")
         else:
             self.tof_dock.set_plot_title(base_title)
             self.tof_dock.set_x_label(base_units)
+        self.tof_dock.set_main_curve_label(curve_label)
         self.total_dock.set_timeseries_label(ts_label)
         self.roi_manager.set_timeseries_label(ts_label)
 
@@ -817,7 +861,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     # =========================================================================
     def _build_connection_config(self):
         s   = self.settings.child('serval', 'serval_destination')
-        adv = s.child('advanced')
+        adv = self.settings.child('pipeline', 'processing', 'advanced')
         return {
             'host': s['dest_host'],
             'port': s['dest_port'],
@@ -829,14 +873,15 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
 
     def _build_extract_config(self):
         p   = self.settings.child('pipeline', 'processing')
+        cor = self.settings.child('pipeline', 'correlation')
         c   = p.child('centroiding')
         adv = p.child('advanced')
         return {
             'num_workers':      p['num_workers'],
             'use_fast_extract': p['use_fast_extract'],
-            'tdc_id':           TDCChannel.from_label(p['tdc_id']),
-            'edge':             TriggerEdge.from_label(p['edge']),
-            'event_window':     (p['event_window_min'], p['event_window_max']),
+            'tdc_id':           TDCChannel.from_label(cor['tdc_id']),
+            'edge':             TriggerEdge.from_label(cor['edge']),
+            'event_window':     (cor['event_window_min'], cor['event_window_max']),
             'use_centroiding':  c['use_centroiding'],
             'eps_space':        c['eps_space'],
             'eps_time_ns':      c['eps_time_ns'],
@@ -861,7 +906,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         }
 
     def _build_command_config(self):
-        s = self.settings.child('pipeline', 'live', 'command_server')
+        s = self.settings.child('pipeline', 'external_control', 'command_server')
         return {'enabled': s['cmd_enabled'], 'port': s['cmd_port']}
 
     # =========================================================================
@@ -914,7 +959,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             self._log(f"Could not fetch detector info (metadata will omit it): {e}", level=30)
 
         callback_mode = self.settings.child('pipeline', 'live', 'callback_mode').value()
-        display_fraction = self.display.child('display_fraction').value() / 100.0
+        display_fraction = self.settings.child('display_settings', 'live_feed', 'display_fraction').value() / 100.0
         self.histogram.set_display_fraction(display_fraction)
 
         self.pipeline_thread = PipelineThread(
@@ -975,7 +1020,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.record_btn.setEnabled(self.serval.is_connected)
         self._set_led(self.led_acquiring, True)
         self._last_clear_time = time.time()
-        refresh_rate_s = self.display.child('refresh_rate_s').value()
+        refresh_rate_s = self.settings.child('display_settings', 'live_feed', 'refresh_rate_s').value()
         if refresh_rate_s > 0:
             self.refresh_timer.start(int(refresh_rate_s * 1000))
         callback_mode = self.settings.child('pipeline', 'live', 'callback_mode').value()
@@ -1132,15 +1177,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             self.settings.child('serval', 'serval_destination'), enabled)
         self.get_action('run').setChecked(not enabled)
 
-        # When locking (enabled=False), restore live-adjustable params so they
-        # remain interactive during acquisition without a pipeline restart.
-        if not enabled:
-            for path in _LIVE_ADJUSTABLE_PARAMS:
-                try:
-                    self._set_group_enabled(self.settings.child(*path), True)
-                except Exception:
-                    pass
-
     # =========================================================================
     # Data Handlers
     # =========================================================================
@@ -1215,7 +1251,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             m, s = divmod(rem, 60)
             self.record_time_label.setText(f"● Rec {h:02d}:{m:02d}:{s:02d}")
 
-        if self.settings.child('pipeline', 'processing', 'covariance', 'cov_enabled').value():
+        if self.settings.child('display_settings', 'covariance', 'cov_enabled').value():
             centers_ns, cov, corr, n_shots = self.histogram.get_covariance_map()
             if self.histogram.is_mass_calibration_enabled():
                 calib = self.display.child('mass_calib')
@@ -1231,7 +1267,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         t_status = time.perf_counter()
 
         if self.is_acquiring and self._last_clear_time is not None:
-            clear_interval = self.display.child('clear_interval').value()
+            clear_interval = self.settings.child('display_settings', 'live_feed', 'clear_interval').value()
             if clear_interval > 0 and (time.time() - self._last_clear_time) >= clear_interval:
                 self.histogram.clear()
                 self._last_clear_time = time.time()
@@ -1286,7 +1322,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             except Exception:
                 s.remove('dockarea_state')  # Discard incompatible saved state
         for child in self.display.children():
-            key = f'display/{child.name()}'
+            key = f'tof/{child.name()}'
             if (val := s.value(key)) is not None:
                 try:
                     child.setValue(type(child.value())(val))
@@ -1314,7 +1350,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         s.setValue('geometry', self.saveGeometry())
         s.setValue('dockarea_state', self.dock_area.saveState())
         for child in self.display.children():
-            s.setValue(f'display/{child.name()}', child.value())
+            s.setValue(f'tof/{child.name()}', child.value())
         for child in self._iter_config_params():
             key = 'config/' + '/'.join(self.settings.childPath(child))
             s.setValue(key, child.value())

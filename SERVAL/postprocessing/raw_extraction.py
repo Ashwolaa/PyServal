@@ -37,54 +37,13 @@ from SERVAL.postprocessing.centroiding import RunStatus
 # =============================================================================
 # Run-group discovery
 # =============================================================================
-#
-# A "run group" is the set of *.tpx3 files belonging to one take. Within one
-# take, the only thing that can multiply a single recording into several
-# files is being split across parallel raw-saver processes (pipeline.py's
-# `start_record` suffixes each with `_raw{i}`, distinct from events' own
-# `_saver{i}` — see centroiding.step_key) — those splits are interleaved
-# chunks of one continuous stream and must be concatenated before
-# correlation, not processed independently. Different scan steps sharing a
-# folder must NOT be merged together.
-
-def raw_step_key(raw_file: Path) -> str:
-    """Run/step identity shared by parallel-raw-saver splits of one take.
-
-    Examples
-    --------
-    '00001.tpx3' -> '00001'
-    '00001_raw0.tpx3' -> '00001'
-    """
-    return re.sub(r"_raw\d+$", "", Path(raw_file).stem)
-
-
-def discover_raw_groups(folder: Path) -> dict:
-    """Group the *.tpx3 files directly inside `folder` by raw_step_key.
-
-    Returns
-    -------
-    dict[str, list[Path]]
-        Mapping of step_key -> sorted list of that run's raw files (in
-        ``_raw{i}`` order when split). Iteration order matches the sorted
-        glob, so single-file folders keep their natural order.
-    """
-    groups: dict = {}
-    for f in sorted(Path(folder).glob("*.tpx3")):
-        groups.setdefault(raw_step_key(f), []).append(f)
-    return groups
-
-
-def load_run_meta(folder: Path) -> Optional[dict]:
-    """Auto-detect and load a single ``*_meta.json`` in `folder`.
-
-    Returns None if none or more than one candidate is found — callers fall
-    back to explicit settings/defaults in that case.
-    """
-    candidates = sorted(Path(folder).glob("*_meta.json"))
-    if len(candidates) != 1:
-        return None
-    with open(candidates[0]) as f:
-        return json.load(f)
+# raw_step_key / discover_raw_groups / load_run_meta live in run_io;
+# re-exported here for backward compatibility with existing importers.
+from SERVAL.postprocessing.run_io import (  # noqa: F401, E402
+    raw_step_key,
+    discover_raw_groups,
+    load_run_meta,
+)
 
 
 def get_raw_status(raw_files: list, events_file: Path) -> RunStatus:

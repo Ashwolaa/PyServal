@@ -33,7 +33,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from qtpy.QtCore import Qt, QThread, Signal
+from qtpy.QtCore import Qt, QSettings, QThread, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
     QApplication,
@@ -59,6 +59,7 @@ from qtpy.QtWidgets import (
 )
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from datpx3.gui.widgets.collapsible import CollapsibleSection
 from SERVAL.core.data_types import TDCChannel, TriggerEdge
 from SERVAL.postprocessing.centroiding import (
     MERGED_CENTROID_DTYPE,
@@ -360,7 +361,7 @@ class PostprocessingGUI(QMainWindow):
         right_layout.setContentsMargins(4, 0, 0, 0)
 
         # Raw extraction parameters
-        raw_group = QGroupBox("Raw extraction (raw .tpx3 → events)")
+        raw_group = QWidget()
         raw_layout = QVBoxLayout(raw_group)
 
         raw_layout.addWidget(QLabel("TDC channel (reference trigger):"))
@@ -396,10 +397,11 @@ class PostprocessingGUI(QMainWindow):
         self._save_triggers_check = QCheckBox("Also save *_triggers.trg")
         raw_layout.addWidget(self._save_triggers_check)
 
-        right_layout.addWidget(raw_group)
+        right_layout.addWidget(CollapsibleSection(
+            "Raw extraction (raw .tpx3 → events)", raw_group, expanded=False))
 
         # DBSCAN centroiding parameters
-        params_group = QGroupBox("Centroiding (events → centroids)")
+        params_group = QWidget()
         params_layout = QVBoxLayout(params_group)
 
         # Backend — same algorithm either way. "cpp" runs the compiled binary
@@ -475,7 +477,8 @@ class PostprocessingGUI(QMainWindow):
         self._diag_check = QCheckBox("Show C++ timing diagnostics")
         params_layout.addWidget(self._diag_check)
 
-        right_layout.addWidget(params_group)
+        right_layout.addWidget(CollapsibleSection(
+            "Centroiding (events → centroids)", params_group, expanded=False))
 
         # Actions
         actions_group = QGroupBox("Actions")
@@ -524,6 +527,13 @@ class PostprocessingGUI(QMainWindow):
         # Log
         log_group = QGroupBox("Log")
         log_layout = QVBoxLayout(log_group)
+        log_btn_row = QHBoxLayout()
+        log_btn_row.addStretch()
+        clear_log_btn = QPushButton("Clear log")
+        clear_log_btn.setFixedWidth(80)
+        clear_log_btn.clicked.connect(self._clear_log)
+        log_btn_row.addWidget(clear_log_btn)
+        log_layout.addLayout(log_btn_row)
         self._log_edit = QTextEdit()
         self._log_edit.setReadOnly(True)
         self._log_edit.setFontFamily("monospace")
@@ -532,6 +542,8 @@ class PostprocessingGUI(QMainWindow):
 
         splitter.addWidget(right)
         splitter.setSizes([780, 480])
+
+        self._restore_session()
 
     # ── Directory ──────────────────────────────────────────────────────────
 
@@ -784,6 +796,74 @@ class PostprocessingGUI(QMainWindow):
 
     def _log(self, msg: str):
         self._log_edit.append(msg)
+
+    def _clear_log(self):
+        self._log_edit.clear()
+
+    # ── Session persistence ────────────────────────────────────────────────
+
+    def _qsettings(self) -> QSettings:
+        return QSettings('SERVAL', 'PostprocessingGUI')
+
+    def _save_session(self):
+        s = self._qsettings()
+        s.setValue('geometry', self.saveGeometry())
+        if self._parent_dir:
+            s.setValue('last_dir', str(self._parent_dir))
+        s.setValue('tdc', self._tdc_combo.currentText())
+        s.setValue('edge', self._edge_combo.currentText())
+        s.setValue('window_override', self._window_override_check.isChecked())
+        s.setValue('window_min', self._raw_window_min_spin.value())
+        s.setValue('window_max', self._raw_window_max_spin.value())
+        s.setValue('save_pixels', self._save_pixels_check.isChecked())
+        s.setValue('save_triggers', self._save_triggers_check.isChecked())
+        s.setValue('backend', self._backend_combo.currentText())
+        s.setValue('epsilon', self._epsilon_spin.value())
+        s.setValue('eps_time', self._eps_time_spin.value())
+        s.setValue('tof_min', self._tof_min_spin.value())
+        s.setValue('tof_max', self._tof_max_spin.value())
+        s.setValue('minpts', self._minpts_spin.value())
+        s.setValue('corr_file', self._corr_edit.text())
+        s.setValue('labels', self._labels_check.isChecked())
+        s.setValue('diagnostics', self._diag_check.isChecked())
+        s.setValue('force_raw', self._force_raw_check.isChecked())
+        s.setValue('force_cent', self._force_cent_check.isChecked())
+
+    def _restore_session(self):
+        s = self._qsettings()
+        if geom := s.value('geometry'):
+            self.restoreGeometry(geom)
+        if last_dir := s.value('last_dir'):
+            p = Path(last_dir)
+            if p.is_dir():
+                self._parent_dir = p
+                self._dir_edit.setText(str(p))
+                self._refresh_tree()
+        if (tdc := s.value('tdc')) and self._tdc_combo.findText(tdc) >= 0:
+            self._tdc_combo.setCurrentText(tdc)
+        if (edge := s.value('edge')) and self._edge_combo.findText(edge) >= 0:
+            self._edge_combo.setCurrentText(edge)
+        self._window_override_check.setChecked(s.value('window_override', False, bool))
+        self._raw_window_min_spin.setValue(s.value('window_min', 0.0, float))
+        self._raw_window_max_spin.setValue(s.value('window_max', 100_000.0, float))
+        self._save_pixels_check.setChecked(s.value('save_pixels', False, bool))
+        self._save_triggers_check.setChecked(s.value('save_triggers', False, bool))
+        if (backend := s.value('backend')) and self._backend_combo.findText(backend) >= 0:
+            self._backend_combo.setCurrentText(backend)
+        self._epsilon_spin.setValue(s.value('epsilon', 2.0, float))
+        self._eps_time_spin.setValue(s.value('eps_time', 100.0, float))
+        self._tof_min_spin.setValue(s.value('tof_min', 0.0, float))
+        self._tof_max_spin.setValue(s.value('tof_max', 1_000_000_000.0, float))
+        self._minpts_spin.setValue(int(s.value('minpts', 1, float)))
+        self._corr_edit.setText(s.value('corr_file') or '')
+        self._labels_check.setChecked(s.value('labels', False, bool))
+        self._diag_check.setChecked(s.value('diagnostics', False, bool))
+        self._force_raw_check.setChecked(s.value('force_raw', False, bool))
+        self._force_cent_check.setChecked(s.value('force_cent', False, bool))
+
+    def closeEvent(self, event):
+        self._save_session()
+        event.accept()
 
     def _on_compile(self):
         self._log("Compiling dbscan_main.cpp…")

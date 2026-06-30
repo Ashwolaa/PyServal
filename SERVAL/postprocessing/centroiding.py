@@ -62,43 +62,9 @@ MERGED_CENTROID_DTYPE = np.dtype([
 # =============================================================================
 # Run-group discovery
 # =============================================================================
-#
-# A "run group" is the set of *_events.dat files belonging to one take. Within
-# one take, the only thing that can multiply a single recording into several
-# files is being split across parallel saver processes (pipeline.py's
-# `start_record` suffixes each with `_saver{i}`) — those must be merged
-# together. Different scan steps (e.g. "00001", "00002", ... from a PyMoDAQ
-# scan sharing one flat folder) are each their own take and must NOT be
-# merged together, even though they're siblings in the same folder.
-
-def step_key(event_file: Path) -> str:
-    """Run/step identity shared by parallel-saver splits of one take.
-
-    Examples
-    --------
-    '00001_events.dat' -> '00001'
-    '00001_saver0_events.dat' -> '00001'
-    """
-    stem = Path(event_file).stem
-    if stem.endswith("_events"):
-        stem = stem[: -len("_events")]
-    return re.sub(r"_saver\d+$", "", stem)
-
-
-def discover_run_groups(folder: Path) -> dict:
-    """Group the *_events.dat files directly inside `folder` by step_key.
-
-    Returns
-    -------
-    dict[str, list[Path]]
-        Mapping of step_key -> sorted list of that run's event files (in
-        ``_saver{i}`` order when split). Iteration order matches the sorted
-        glob, so single-step folders keep their natural order.
-    """
-    groups: dict = {}
-    for f in sorted(Path(folder).glob("*_events.dat")):
-        groups.setdefault(step_key(f), []).append(f)
-    return groups
+# step_key / discover_run_groups live in run_io; re-exported here for
+# backward compatibility with existing importers.
+from SERVAL.postprocessing.run_io import step_key, discover_run_groups  # noqa: F401, E402
 
 
 # =============================================================================

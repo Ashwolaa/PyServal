@@ -107,7 +107,7 @@ class TofHistogramDock(_BasePlotDock):
 
         # ── Splitter: binning pane | plot | ROI pane ─────────────────────────
         splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(CollapsiblePane("TOF Binning", self.tof_bin_spec_widget))
+        splitter.addWidget(CollapsiblePane("TOF Binning", self.tof_bin_spec_widget, expanded=False))
         splitter.addWidget(self.tof_plot)
         self._roi_pane = CollapsiblePane("TOF ROIs", self._roi_container, expanded=False)
         splitter.addWidget(self._roi_pane)

@@ -84,8 +84,8 @@ class _PipelineMixin:
         }
 
     def _build_save_config(self):
-        p   = self.settings.child('pipeline', 'saving')
-        adv = p.child('advanced')
+        p   = self.settings.child('saving')
+        adv = self.settings.child('pipeline', 'processing', 'advanced')
         return {
             'output_dir': p['output_dir'],
             'raw':      {'enabled': p['save_raw'],     'num_savers': adv['raw_num_savers']},
@@ -176,8 +176,7 @@ class _PipelineMixin:
     def _on_pipeline_started(self):
         self._log("TCP socket bound — configuring SERVAL...")
         try:
-            p = self.settings.child('pipeline', 'saving')
-            log_path = Path(p['output_dir']) / 'serval.log'
+            log_path = Path(self.settings.child('saving')['output_dir']) / 'serval.log'
             enable_file_logging(log_path)
             self._log(f"Logging to file: {log_path}")
         except Exception as e:
@@ -259,7 +258,7 @@ class _PipelineMixin:
             self._save_timer.stop()
             self._stop_save()
         else:
-            p = self.settings.child('pipeline', 'saving')
+            p = self.settings.child('saving')
             output_dir = Path(p['output_dir'])
             if not self._validate_output_dir(output_dir):
                 return
@@ -355,6 +354,5 @@ class _PipelineMixin:
 
     def _set_pipeline_controls_enabled(self, enabled: bool):
         _set_group_enabled(self.settings.child('pipeline'), enabled)
-        _set_group_enabled(
-            self.settings.child('serval', 'serval_destination'), enabled)
+        _set_group_enabled(self.settings.child('serval', 'serval_destination'), enabled)
         self.get_action('run').setChecked(not enabled)

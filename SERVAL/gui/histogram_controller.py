@@ -639,15 +639,20 @@ class HistogramController:
         with self._lock:
             self._cov_enabled = enabled
 
-    def set_covariance_config(self, bins: int):
+    def set_covariance_config(self, bins: int = None, cov_range=None):
         """Resize the covariance accumulators and reset all accumulated data."""
         with self._lock:
-            self._cov_bins = bins
+            if bins is not None:
+                self._cov_bins = bins
+            if cov_range is not None:
+                self._cov_range = cov_range
+            else:
+                self._cov_range = getattr(self, '_cov_range', self._tof_range)
             self._cov_edges = np.linspace(
-                self._tof_range[0], self._tof_range[1], bins + 1)
+                self._cov_range[0], self._cov_range[1], self._cov_bins + 1)
             self._cov_centers = (self._cov_edges[:-1] + self._cov_edges[1:]) / 2
-            self._cov_S1 = np.zeros(bins, dtype=np.float64)
-            self._cov_S2 = np.zeros((bins, bins), dtype=np.float64)
+            self._cov_S1 = np.zeros(self._cov_bins, dtype=np.float64)
+            self._cov_S2 = np.zeros((self._cov_bins, self._cov_bins), dtype=np.float64)
             self._cov_n_shots = 0
 
     def get_covariance_map(self):

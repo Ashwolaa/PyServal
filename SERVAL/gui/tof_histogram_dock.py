@@ -1,18 +1,15 @@
 """
-TofHistogramDock — dock widget containing the TOF histogram, display settings,
-and the ROI table panel.
+TofHistogramDock — dock widget containing the TOF histogram and the ROI table panel.
 
-Owns the ``display`` Parameter group (TOF range, bins, mass calibration).
-Internal toolbar buttons emit signals; the caller wires them to ROIManager methods.
-Sub-panels collapse/expand via CollapsibleSection accordion headers.
+Sub-panels (TOF Binning, ROI table) collapse/expand via CollapsiblePane headers
+inside a QSplitter so the user can freely resize them.
+
+Mass calibration settings live in the main settings tree (acquisition_params.py).
 """
 
 import pyqtgraph as pg
-from pyqtgraph.dockarea import Dock
-from pyqtgraph.parametertree.Parameter import Parameter
-from pymodaq_gui.parameter import ParameterTree
-from pymodaq_gui.utils.styling import create_icon
-from datpx3.gui.widgets.collapsible import CollapsibleSection
+from datpx3.analysis.binning import BinSpec
+from datpx3.gui.plots.bin_spec_widget import BinSpecWidget
 
 from qtpy.QtCore import Qt, QSize, Signal
 from qtpy.QtWidgets import (
@@ -20,17 +17,22 @@ from qtpy.QtWidgets import (
     QHeaderView,
     QLabel,
     QPushButton,
-    QSizePolicy,
+    QSplitter,
     QTableWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
+from pymodaq_gui.utils.styling import create_icon
 
-class TofHistogramDock(Dock):
+from SERVAL.gui.base_plot_dock import _BasePlotDock
+from SERVAL.gui.widgets.collapsible_pane import CollapsiblePane
+
+
+class TofHistogramDock(_BasePlotDock):
     """
-    Dock widget containing the TOF histogram, display-settings panel, and ROI table.
+    Dock widget containing the TOF histogram and ROI table.
 
     Signals
     -------
@@ -38,48 +40,23 @@ class TofHistogramDock(Dock):
         Emitted when the user clicks the Clear button.
     add_roi_clicked / remove_roi_clicked / raise_roi_clicked / zoom_roi_clicked / zoom_out_clicked
         Emitted by the ROI mini-toolbar; wire to ROIManager methods.
+    tof_bin_spec_changed
+        Emitted when the TOF binning widget changes.
     """
 
-    clear_requested = Signal()
     add_roi_clicked = Signal()
     remove_roi_clicked = Signal()
     raise_roi_clicked = Signal()
     zoom_roi_clicked = Signal()
     zoom_out_clicked = Signal()
-
-    display_params = [
-        {'title': 'TOF Min (ns)', 'name': 'tof_min_ns', 'type': 'float',
-         'value': 0.0, 'limits': (0.0, 1e9),
-         'tip': 'Lower bound of the TOF histogram axis (ns)'},
-        {'title': 'TOF Max (ns)', 'name': 'tof_max_ns', 'type': 'float',
-         'value': 100000.0, 'limits': (0.0, 1e9),
-         'tip': 'Upper bound of the TOF histogram axis (ns)'},
-        {'title': 'TOF Bins', 'name': 'tof_bins', 'type': 'int', 'value': 1000,
-         'limits': (100, 10000),
-         'tip': 'Number of bins in the TOF histogram'},
-        {'title': 'Mass Calibration', 'name': 'mass_calib', 'type': 'group', 'children': [
-            {'title': 'Enable (show m/z)', 'name': 'enabled', 'type': 'bool', 'value': False,
-             'tip': 'Display the histogram in calibrated mass units instead of TOF/TOA'},
-            {'title': 'Coeff (ns / sqrt(mass))', 'name': 'coeff', 'type': 'float',
-             'value': 1.0, 'tip': 'Calibration slope: tof_ns = coeff * sqrt(mass) + t0'},
-            {'title': 't0 (ns)', 'name': 't0', 'type': 'float', 'value': 0.0,
-             'tip': 'Calibration time offset: tof_ns = coeff * sqrt(mass) + t0'},
-            {'title': 'Mass Min', 'name': 'mass_min', 'type': 'float', 'value': 0.0,
-             'tip': 'Lower bound of the mass histogram axis'},
-            {'title': 'Mass Max', 'name': 'mass_max', 'type': 'float', 'value': 200.0,
-             'tip': 'Upper bound of the mass histogram axis'},
-            {'title': 'Mass Bins', 'name': 'mass_bins', 'type': 'int', 'value': 1000,
-             'limits': (100, 10000), 'tip': 'Number of bins in the mass histogram'},
-        ]},
-    ]
+    tof_bin_spec_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__("TOF Histogram", closable=False, size=(500, 600))
 
-        # ── Display parameters ────────────────────────────────────────────────
-        self.display = Parameter.create(
-            name='display', type='group', children=self.display_params
-        )
+        # ── TOF bin spec widget ───────────────────────────────────────────────
+        self.tof_bin_spec_widget = BinSpecWidget(start=0.0, end=100_000.0, n_bins=1000)
+        self.tof_bin_spec_widget.changed.connect(self.tof_bin_spec_changed)
 
         # ── Main layout ───────────────────────────────────────────────────────
         widget = QWidget()
@@ -87,21 +64,7 @@ class TofHistogramDock(Dock):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(2)
 
-        # ── Toolbar: coord | spacer | Legend | sep | Clear ────────────────────
-        toolbar = QToolBar()
-        toolbar.setIconSize(QSize(16, 16))
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-
-        self.coord_label = QLabel("")
-        self.coord_label.setStyleSheet("color: gray;")
-        self.coord_label.setMinimumWidth(180)
-        toolbar.addWidget(self.coord_label)
-
-        _spacer = QWidget()
-        _spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        toolbar.addWidget(_spacer)
-
+        # ── Toolbar ───────────────────────────────────────────────────────────
         self._legend_toggle = QAction(
             create_icon('legend_toggle', icon_color='orange', icon_checked_color='green'),
             'Legend', self
@@ -109,21 +72,14 @@ class TofHistogramDock(Dock):
         self._legend_toggle.setCheckable(True)
         self._legend_toggle.setToolTip("Show/hide plot legend")
         self._legend_toggle.toggled.connect(self._on_legend_toggled)
-        toolbar.addAction(self._legend_toggle)
 
-        toolbar.addSeparator()
-
-        clear_action = QAction(create_icon('ink_eraser'), 'Clear', self)
-        clear_action.setToolTip("Clear histograms and time series")
-        clear_action.triggered.connect(self.clear_requested)
-        toolbar.addAction(clear_action)
-
+        toolbar = self._build_header_toolbar(
+            right_actions=[self._legend_toggle],
+            icon_size=(16, 16),
+            tool_button_style=Qt.ToolButtonStyle.ToolButtonTextUnderIcon,
+            coord_min_width=180,
+        )
         layout.addWidget(toolbar)
-
-        # ── Histogram settings accordion ──────────────────────────────────────
-        self.display_tree = ParameterTree()
-        self.display_tree.setParameters(self.display, showTop=False)
-        layout.addWidget(CollapsibleSection("Histogram settings", self.display_tree))
 
         # ── TOF histogram plot ────────────────────────────────────────────────
         self.tof_plot = pg.PlotWidget()
@@ -132,7 +88,6 @@ class TofHistogramDock(Dock):
         self.tof_plot.showGrid(x=True, y=True)
 
         # Legend — hidden by default; toggled with the Legend toolbar button.
-        # Must be created before the curves so named curves auto-register.
         self._tof_legend = self.tof_plot.addLegend()
         self._tof_legend.setVisible(False)
 
@@ -142,17 +97,25 @@ class TofHistogramDock(Dock):
             brush=(100, 100, 200, 100),
             name='All',
         )
-        self.tof_plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        self._wire_coord_mouse(self.tof_plot)
 
         self._spatial_tof_curves: dict[str, pg.PlotDataItem] = {}
         self._combined_tof_curve: pg.PlotDataItem | None = None
 
-        layout.addWidget(self.tof_plot, stretch=1)
-
-        # ── ROI Table accordion ───────────────────────────────────────────────
+        # ── ROI container ─────────────────────────────────────────────────────
         self._roi_container = self._build_roi_container()
-        layout.addWidget(CollapsibleSection("TOF ROIs", self._roi_container))
 
+        # ── Splitter: binning pane | plot | ROI pane ─────────────────────────
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(CollapsiblePane("TOF Binning", self.tof_bin_spec_widget))
+        splitter.addWidget(self.tof_plot)
+        self._roi_pane = CollapsiblePane("TOF ROIs", self._roi_container, expanded=False)
+        splitter.addWidget(self._roi_pane)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 1)
+
+        layout.addWidget(splitter)
         self.addWidget(widget)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -230,20 +193,16 @@ class TofHistogramDock(Dock):
     # Internal handlers
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _on_mouse_moved(self, scene_pos):
-        """Show the cursor's (x, y) position in plot coordinates."""
-        if not self.tof_plot.sceneBoundingRect().contains(scene_pos):
-            self.coord_label.setText("")
-            return
-        view_pos = self.tof_plot.getPlotItem().vb.mapSceneToView(scene_pos)
-        self.coord_label.setText(f"x={view_pos.x():.1f}, y={view_pos.y():.0f}")
-
     def _on_legend_toggled(self, checked: bool):
         self._tof_legend.setVisible(checked)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    def tof_bin_spec(self) -> BinSpec | None:
+        """Return the current TOF BinSpec, or None if the widget state is invalid."""
+        return self.tof_bin_spec_widget.bin_spec()
 
     def update_tof(self, centers, counts):
         """Update the TOF histogram curve."""

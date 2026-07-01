@@ -5,14 +5,12 @@ Also exports ROI_COLORS, the default colour palette for TOF ROI regions.
 """
 
 import pyqtgraph as pg
-from pyqtgraph.dockarea import Dock
 from qtpy.QtCore import Qt, QSize, Signal
 from qtpy.QtWidgets import (
     QAction,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QSizePolicy,
     QSplitter,
     QTableWidget,
     QToolBar,
@@ -22,6 +20,7 @@ from qtpy.QtWidgets import (
 
 from pymodaq_gui.utils.styling import create_icon
 
+from SERVAL.gui.base_plot_dock import _BasePlotDock
 from SERVAL.gui.widgets.collapsible_pane import CollapsiblePane
 
 # ROI colours palette (R, G, B, alpha)
@@ -37,13 +36,12 @@ ROI_COLORS = [
 ]
 
 
-class ImageDockWidget(Dock):
+class ImageDockWidget(_BasePlotDock):
     """Dock widget containing a 2D histogram image with counts display and time series plot."""
 
     # Emitted by the ROI mini-toolbar; wire to a SpatialROIManager's add_roi/remove_roi.
     add_roi_clicked = Signal()
     remove_roi_clicked = Signal()
-    clear_requested = Signal()
 
     def __init__(self, title, color=None, closable=True, parent=None):
         super().__init__(title, closable=closable, size=(300, 400))
@@ -54,13 +52,9 @@ class ImageDockWidget(Dock):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(1)
 
-        # ── Toolbar: color● | Counts | Yield% | coord | spacer | Clear ─────────
-        header_tb = QToolBar()
-        header_tb.setIconSize(QSize(18, 18))
-        header_tb.setMovable(False)
-        header_tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-
+        # ── Toolbar ───────────────────────────────────────────────────────────
         self._color_indicator = None
+        left_widgets = []
         if color:
             self._color_indicator = QLabel()
             self._color_indicator.setFixedSize(14, 14)
@@ -68,24 +62,13 @@ class ImageDockWidget(Dock):
                 f"background-color: rgba({color[0]},{color[1]},{color[2]},200);"
                 f" border: 1px solid black;"
             )
-            header_tb.addWidget(self._color_indicator)
+            left_widgets.append(self._color_indicator)
 
         self.counts_label = QLabel("Counts: 0")
         self.counts_label.setStyleSheet("font-weight: bold;")
-        header_tb.addWidget(self.counts_label)
-
         self.yield_label = QLabel("  (0.0%)")
         self.yield_label.setStyleSheet("color: gray;")
-        header_tb.addWidget(self.yield_label)
-
-        self.coord_label = QLabel("")
-        self.coord_label.setStyleSheet("color: gray;")
-        self.coord_label.setMinimumWidth(150)
-        header_tb.addWidget(self.coord_label)
-
-        _spacer = QWidget()
-        _spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        header_tb.addWidget(_spacer)
+        left_widgets.extend([self.counts_label, self.yield_label])
 
         self.lock_levels_check = QAction(
             create_icon('lock', icon_color='orange', icon_checked_color='green'),
@@ -95,15 +78,14 @@ class ImageDockWidget(Dock):
         self.lock_levels_check.setChecked(False)
         self.lock_levels_check.setToolTip(
             "Lock the colorbar levels so they don't auto-rescale on every update")
-        header_tb.addAction(self.lock_levels_check)
 
-        header_tb.addSeparator()
-
-        clear_action = QAction(create_icon('ink_eraser'), 'Clear', self)
-        clear_action.setToolTip("Clear image and time series")
-        clear_action.triggered.connect(self.clear_requested)
-        header_tb.addAction(clear_action)
-
+        header_tb = self._build_header_toolbar(
+            left_widgets=left_widgets,
+            right_actions=[self.lock_levels_check],
+            icon_size=(18, 18),
+            tool_button_style=Qt.ToolButtonStyle.ToolButtonIconOnly,
+            coord_min_width=150,
+        )
         layout.addWidget(header_tb)
 
         # ── Image + LUT ───────────────────────────────────────────────────────
@@ -118,9 +100,8 @@ class ImageDockWidget(Dock):
         self.plot.setXRange(0, 256)
         self.plot.setYRange(0, 256)
         self._last_data = None
-        self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        self._wire_coord_mouse(self.plot)
 
-        # Histogram LUT widget — drag the lower/upper handles to tune intensity scaling
         self.histogram_lut = pg.HistogramLUTWidget()
         self.histogram_lut.setImageItem(self.image)
         self.histogram_lut.gradient.loadPreset('viridis')
@@ -133,8 +114,6 @@ class ImageDockWidget(Dock):
         image_row.addWidget(self.histogram_lut, stretch=1)
 
         # ── Splitter: image | counts-over-time | spatial ROIs ─────────────────
-        # Each sub-panel is a _CollapsiblePane: drag the handle to resize,
-        # click the ▶/▼ header to collapse/expand.
         self.timeseries_plot = pg.PlotWidget()
         self.timeseries_plot.setLabel('left', 'Counts/Shot')
         self.timeseries_plot.setLabel('bottom', 'Time', units='s')
@@ -161,10 +140,22 @@ class ImageDockWidget(Dock):
         self._vsplitter.addWidget(self._roi_pane)
         self._vsplitter.setStretchFactor(0, 3)
         self._vsplitter.setStretchFactor(1, 1)
-        self._vsplitter.setStretchFactor(2, 0)  # starts collapsed → no extra space
+        self._vsplitter.setStretchFactor(2, 0)
 
         layout.addWidget(self._vsplitter)
         self.addWidget(widget)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # _BasePlotDock overrides
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _format_coord(self, view_pos) -> str:
+        ix, iy = int(view_pos.x()), int(view_pos.y())
+        text = f"x={ix}, y={iy}"
+        if (self._last_data is not None
+                and 0 <= iy < self._last_data.shape[0] and 0 <= ix < self._last_data.shape[1]):
+            text += f", val={self._last_data[iy, ix]:,}"
+        return text
 
     # ─────────────────────────────────────────────────────────────────────────
     # Private helpers
@@ -194,8 +185,6 @@ class ImageDockWidget(Dock):
         roi_layout.addWidget(roi_tb)
 
         # ROI table — cols: color | name | shape | op | x | y | w | h | counts | yield% | vis | lock
-        # Shape (col 2): "▭" rect  / "○" ellipse  — click to cycle
-        # Op    (col 3): "⊕" include / "⊖" exclude — click to toggle; drives the combined mask
         self.roi_table = QTableWidget()
         self.roi_table.setColumnCount(12)
         self.roi_table.setHorizontalHeaderLabels(
@@ -216,23 +205,6 @@ class ImageDockWidget(Dock):
         roi_layout.addWidget(self.roi_table)
 
         return roi_widget
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Internal handlers
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _on_mouse_moved(self, scene_pos):
-        """Show the pixel coordinate (and value) under the mouse cursor."""
-        if not self.plot.sceneBoundingRect().contains(scene_pos):
-            self.coord_label.setText("")
-            return
-        view_pos = self.plot.getPlotItem().vb.mapSceneToView(scene_pos)
-        ix, iy = int(view_pos.x()), int(view_pos.y())
-        text = f"x={ix}, y={iy}"
-        if (self._last_data is not None
-                and 0 <= iy < self._last_data.shape[0] and 0 <= ix < self._last_data.shape[1]):
-            text += f", val={self._last_data[iy, ix]:,}"
-        self.coord_label.setText(text)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API

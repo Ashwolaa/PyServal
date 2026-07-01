@@ -26,6 +26,9 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from datpx3.analysis.binning import BinSpec
+from datpx3.gui.plots.bin_spec_widget import BinSpecWidget
+from datpx3.gui.widgets.collapsible import CollapsibleSection
 from pymodaq_gui.utils.styling import create_icon
 
 
@@ -45,6 +48,7 @@ class CovarianceDock(Dock):
     """Dock widget displaying the 2D per-shot covariance (or correlation) map."""
 
     clear_requested = Signal()
+    cov_bin_spec_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__("Covariance Map", closable=False, size=(500, 500))
@@ -109,6 +113,12 @@ class CovarianceDock(Dock):
         tb.addAction(clear_action)
 
         layout.addWidget(tb)
+
+        # ── Binning accordion ─────────────────────────────────────────────────
+        self.cov_bin_spec_widget = BinSpecWidget(start=0.0, end=100_000.0, n_bins=200)
+        self.cov_bin_spec_widget.changed.connect(self.cov_bin_spec_changed)
+        layout.addWidget(CollapsibleSection("Covariance Binning", self.cov_bin_spec_widget,
+                                           expanded=False))
 
         # ── Image + LUT ───────────────────────────────────────────────────────
         self.plot = pg.PlotWidget()
@@ -186,6 +196,14 @@ class CovarianceDock(Dock):
                 self.image.setLevels([-vmax, vmax])
 
         self._shots_label.setText(f"N shots: {n_shots:,}")
+
+    def cov_bin_spec(self) -> BinSpec | None:
+        """Return the current covariance BinSpec, or None if the widget state is invalid."""
+        return self.cov_bin_spec_widget.bin_spec()
+
+    def set_tof_range(self, start: float, end: float):
+        """Update the Auto button's memory without forcing a re-bin."""
+        self.cov_bin_spec_widget.set_data_range(start, end)
 
     def set_axis_label(self, label: str):
         self.plot.setLabel('bottom', label)

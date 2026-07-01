@@ -11,11 +11,8 @@ Usage:
     python -m SERVAL.gui.acquisition_gui
 """
 
-import os
 import sys
-import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 # Register PyServal's extra Material Icons into Qt's resource system before any
@@ -27,7 +24,7 @@ except ModuleNotFoundError:
 
 import numpy as np
 from pyqtgraph.dockarea import DockArea, Dock
-from qtpy.QtCore import QObject, Qt, QSettings, QTimer, Signal
+from qtpy.QtCore import QObject, Qt, QTimer, Signal
 from qtpy.QtWidgets import (
     QActionGroup,
     QApplication,
@@ -47,26 +44,25 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-import re
 
 from pymodaq_gui.managers.action_manager import ActionManager
 from pymodaq_gui.managers.parameter_manager import ParameterManager
 from pymodaq_gui.utils.styling import create_icon
 
 from SERVAL.controllers.serval_control import SERVALController
-from SERVAL.core.data_types import TDCChannel, TriggerEdge
+from SERVAL.gui.acquisition_params import ACQUISITION_PARAMS
 from SERVAL.gui.histogram_controller import HistogramController
 from SERVAL.gui.image_dock_widget import ImageDockWidget
 from SERVAL.gui.log_dock import LogDock
+from SERVAL.gui.pipeline_mixin import _PipelineMixin
 from SERVAL.gui.pipeline_status_dock import PipelineStatusDock
-from SERVAL.gui.pipeline_thread import PipelineThread
 from SERVAL.gui.roi_manager import ROIManager
+from SERVAL.gui.session_mixin import _SessionMixin
 from SERVAL.gui.spatial_roi_manager import SpatialROIManager
 from SERVAL.gui.covariance_dock import CovarianceDock
 from SERVAL.gui.tof_histogram_dock import TofHistogramDock
 from SERVAL.utils.logging import (
-    add_log_handler, get_logger, remove_log_handler,
-    enable_file_logging, disable_file_logging,set_log_level
+    add_log_handler, get_logger, remove_log_handler, set_log_level
 )
 
 # Log a per-step timing breakdown of _update_histograms() when the total
@@ -78,16 +74,6 @@ _SLOW_REFRESH_MS = 20.0
 # does not require a pipeline restart to take effect.
 _LIVE_ADJUSTABLE_PARAMS: list[tuple[str, ...]] = []
 set_log_level('DEBUG')
-def _increment_filename(name: str) -> str:
-    """Bump the trailing run of digits in *name* by one, preserving zero-padding.
-
-    e.g. 'run_007' -> 'run_008', 'scan42' -> 'scan43', 'run' -> 'run_1'.
-    """
-    m = re.search(r'(\d+)$', name)
-    if m:
-        next_num = str(int(m.group(1)) + 1).zfill(len(m.group(1)))
-        return name[:m.start()] + next_num
-    return f'{name}_1'
 
 
 class _ServalSignaller(QObject):
@@ -96,7 +82,8 @@ class _ServalSignaller(QObject):
     failed = Signal(str)
 
 
-class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
+class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager,
+                           _SessionMixin, _PipelineMixin):
     """
     Main GUI for SERVAL acquisition with live histograms.
 
@@ -115,184 +102,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     """
 
     settings_name = 'serval_acquisition'
-    params = [
-        {'title': 'SERVAL', 'name': 'serval', 'type': 'group', 'children': [
-            {'title': 'Connection', 'name': 'serval_connection', 'type': 'action_led', 'children': [
-                {'title': 'Host', 'name': 'host', 'type': 'str', 'value': '192.168.1.1',
-                 'tip': 'IP address of the SERVAL server'},
-                {'title': 'Port', 'name': 'port', 'type': 'int', 'value': 8080,
-                 'limits': (1, 65535), 'tip': 'SERVAL HTTP REST API port (default 8080)'},
-            ]},
-            {'title': 'Destination', 'name': 'serval_destination', 'type': 'action_led', 'children': [
-                {'title': 'Dest. Host', 'name': 'dest_host', 'type': 'str', 'value': '192.168.1.2',
-                 'tip': 'IP address of this machine as seen from the SERVAL server'},
-                {'title': 'Dest. Port', 'name': 'dest_port', 'type': 'int', 'value': 8088,
-                 'limits': (1, 65535), 'tip': 'TCP port on which the pipeline listens for incoming data'},
-            ]},
-            {'title': 'Voltage', 'name': 'voltage_settings', 'type': 'action_led', 'children': [
-                {'title': 'Bias Voltage (V)', 'name': 'bias_voltage', 'type': 'int',
-                 'value': 40, 'limits': (0, 200),
-                 'tip': 'Sensor bias voltage. Typical range 40–100 V. Apply with the Voltage button.'},
-                {'title': 'Bias Enabled', 'name': 'bias_enabled', 'type': 'bool', 'value': True,
-                 'tip': 'Enable or disable the bias voltage supply'},
-            ]},
-            {'title': 'Triggers', 'name': 'trigger_settings', 'type': 'action_led', 'children': [
-                {'title': 'Trigger Mode', 'name': 'trigger_mode', 'type': 'list',
-                 'limits': ['CONTINUOUS', 'AUTOTRIGSTART_TIMERSTOP', 'EXTERNAL'
-                 'PEXSTART_NEXSTOP', 'NEXSTART_PEXSTOP', 'PEXSTART_TIMERSTOP', 'NEXSTART_TIMERSTOP',
-                 ],
-                 'value': 'CONTINUOUS',
-                 'tip': ('CONTINUOUS: free-running, no trigger correlation.\n'
-                         'AUTOTRIGSTART_TIMERSTOP: internal timer generates triggers at Period/Exposure.\n'
-                         'EXTERNAL: triggers come from the TDC input (hardware signal required).\n'
-                         'PEXSTART_NEXSTOP: Acq. is started by positive edge external trigger input, stopped by negative edge.\n'
-                         'NEXSTART_PEXSTOP: Acq. is started by negative edge external trigger input, stopped by positive edge.\n'
-                         'PEXSTART_TIMERSTOP: Acq. is started by positive edge external trigger input, stopped by HW timer.\n'
-                         'NEXSTART_TIMERSTOP: Acq. is started by negative edge external trigger input, stopped by HW timer.\n'
-                         )},
-                {'title': 'N Triggers', 'name': 'n_triggers', 'type': 'int', 'value': -1,
-                 'limits': (-1, 1000000), 'tip': 'Number of triggers before auto-stop. -1 = unlimited.'},
-                {'title': 'Period (s)', 'name': 'trigger_period', 'type': 'float',
-                 'value': 0.5, 'limits': (0.001, 1000.0),
-                 'tip': 'Time between trigger starts (AUTOTRIGSTART_TIMERSTOP mode only)'},
-                {'title': 'Exposure (s)', 'name': 'trigger_exposure', 'type': 'float',
-                 'value': 0.01, 'limits': (0.0001, 100.0),
-                 'tip': 'Active acquisition window per trigger (AUTOTRIGSTART_TIMERSTOP mode only)'},
-            ]},
-        ]},
-        {'title': 'Acquisition', 'name': 'pipeline', 'type': 'group',
-         'tip': 'Pipeline configuration — locked while acquisition is running', 'children': [
-            {'title': 'Correlation', 'name': 'correlation', 'type': 'group', 'children': [
-                {'title': 'TDC', 'name': 'tdc_id', 'type': 'list',
-                 'limits': TDCChannel.labels(), 'value': TDCChannel.TDC1.label,
-                 'tip': 'TDC channel carrying the trigger signal used for TOF correlation'},
-                {'title': 'Edge', 'name': 'edge', 'type': 'list',
-                 'limits': TriggerEdge.labels(), 'value': TriggerEdge.RISING.label,
-                 'tip': 'Which edge of the TDC signal marks the trigger time (Rising or Falling)'},
-                {'title': 'Event Window Min (ns)', 'name': 'event_window_min', 'type': 'float',
-                 'value': 0.0,
-                 'tip': 'Minimum TOF for a pixel to be correlated to a trigger (ns)'},
-                {'title': 'Event Window Max (ns)', 'name': 'event_window_max', 'type': 'float',
-                 'value': 100000.0,
-                 'tip': 'Maximum TOF for a pixel to be correlated to a trigger (ns)'},
-            ]},
-            {'title': 'Extraction', 'name': 'processing', 'type': 'group', 'children': [
-                {'title': 'Workers', 'name': 'num_workers', 'type': 'int', 'value': 4,
-                 'limits': (1, 16),
-                 'tip': 'Number of parallel extractor processes. Match to available CPU cores.'},
-                {'title': 'Fast Extract', 'name': 'use_fast_extract', 'type': 'bool',
-                 'value': True,
-                 'tip': 'Use optimised (Numba JIT) extraction path. Disable only for debugging.'},
-                {'title': 'Centroiding', 'name': 'centroiding', 'type': 'group', 'children': [
-                    {'title': 'Enable', 'name': 'use_centroiding', 'type': 'bool', 'value': False,
-                     'tip': 'Cluster neighbouring pixel hits into single events (reduces charge sharing artefacts)'},
-                    {'title': 'Spatial eps (px)', 'name': 'eps_space', 'type': 'int',
-                     'value': 2, 'limits': (1, 10),
-                     'tip': 'Maximum pixel distance between hits in the same cluster'},
-                    {'title': 'Time eps (ns)', 'name': 'eps_time_ns', 'type': 'float',
-                     'value': 100.0, 'limits': (1.0, 10000.0), 'step': 1.0, 'decimals': 0,
-                     'tip': 'Maximum time difference between hits in the same cluster (ns)'},
-                ]},
-                {'title': 'Advanced', 'name': 'advanced', 'type': 'group', 'children': [
-                    {'title': 'ZMQ Port', 'name': 'zmq_port', 'type': 'int', 'value': 9200,
-                     'limits': (1024, 65535),
-                     'tip': 'Internal ZMQ port used between TCP receiver and extractor workers'},
-                    {'title': 'ZMQ HWM', 'name': 'zmq_hwm', 'type': 'int', 'value': 1000,
-                     'limits': (10, 100000),
-                     'tip': 'ZMQ high-water mark — max queued messages before chunks are dropped'},
-                    {'title': 'Triggers / Chunk', 'name': 'triggers_per_chunk', 'type': 'int',
-                     'value': 100, 'limits': (0, 100_000),
-                     'tip': ('Flush to workers every N rising edges of the selected TDC. '
-                             'Each worker chunk is then guaranteed to contain exactly N '
-                             'complete laser shots with no cross-chunk orphaned pixels. '
-                             '0 = disabled, use chunk size / timeout only.')},
-                    {'title': 'Chunk Size (B)', 'name': 'chunk_size', 'type': 'int',
-                     'value': 10_000_000, 'limits': (100_000, 100_000_000),
-                     'tip': 'Fallback: flush after this many bytes when trigger-aligned flushing is disabled or not enough triggers have arrived yet'},
-                    {'title': 'Flush Timeout (s)', 'name': 'flush_timeout', 'type': 'float',
-                     'value': 0.3, 'limits': (0.01, 5.0),
-                     'tip': 'Force flush after this many seconds even if chunk size / trigger count not reached'},
-                    {'title': 'Recv Buffer (MB)', 'name': 'recv_buffer_mb', 'type': 'int',
-                     'value': 2, 'limits': (1, 512),
-                     'tip': 'OS-level TCP receive buffer size — increase if seeing dropped chunks at high rates'},
-                ]},
-            ]},
-            {'title': 'Saving', 'name': 'saving', 'type': 'group', 'children': [
-                {'title': 'Output Directory', 'name': 'output_dir', 'type': 'str',
-                 'value': './data',
-                 'tip': 'Root directory for saved data. Each recording creates a timestamped subdirectory here.'},
-                {'title': 'Save Raw', 'name': 'save_raw', 'type': 'bool', 'value': True,
-                 'tip': 'Write raw TPX3 binary stream to .tpx3 file (needed to reprocess offline)'},
-                {'title': 'Save Events', 'name': 'save_events', 'type': 'bool', 'value': True,
-                 'tip': 'Write correlated TOF events to _events.dat (numpy structured array)'},
-                {'title': 'Save Pixels', 'name': 'save_pixels', 'type': 'bool', 'value': False,
-                 'tip': 'Write uncorrelated pixel hits to _pixels.dat (numpy structured array)'},
-                {'title': 'Save Triggers', 'name': 'save_triggers', 'type': 'bool', 'value': True,
-                 'tip': 'Write TDC trigger timestamps to _triggers.dat'},
-                {'title': 'Advanced', 'name': 'advanced', 'type': 'group', 'children': [
-                    {'title': 'Raw Savers', 'name': 'raw_num_savers', 'type': 'int',
-                     'value': 1, 'limits': (0, 4),
-                     'tip': 'Number of parallel processes writing raw data (0 disables raw saving)'},
-                    {'title': 'Events Savers', 'name': 'events_num_savers', 'type': 'int',
-                     'value': 2, 'limits': (0, 8),
-                     'tip': 'Number of parallel processes writing event data'},
-                    {'title': 'Pixels Savers', 'name': 'pixels_num_savers', 'type': 'int',
-                     'value': 1, 'limits': (0, 4),
-                     'tip': 'Number of parallel processes writing pixel data'},
-                    {'title': 'Triggers Savers', 'name': 'triggers_num_savers', 'type': 'int',
-                     'value': 1, 'limits': (0, 4),
-                     'tip': 'Number of parallel processes writing trigger data'},
-                ]},
-            ]},
-            {'title': 'Live Feed', 'name': 'live', 'type': 'group', 'children': [
-                {'title': 'Callback Mode', 'name': 'callback_mode', 'type': 'list',
-                 'limits': ['events', 'pixels', 'disabled'], 'value': 'events',
-                 'tip': 'What data the pipeline sends to the GUI for live display. Disable to reduce overhead.'},
-            ]},
-            {'title': 'External Control', 'name': 'external_control', 'type': 'group', 'children': [
-                {'title': 'Command Server', 'name': 'command_server', 'type': 'group', 'children': [
-                    {'title': 'Enable', 'name': 'cmd_enabled', 'type': 'bool', 'value': True,
-                     'tip': 'Enable ZMQ command server for external control (e.g. from PyMoDAQ)'},
-                    {'title': 'Port', 'name': 'cmd_port', 'type': 'int', 'value': 9100,
-                     'limits': (1024, 65535),
-                     'tip': 'ZMQ port for the command server'},
-                ]},
-            ]},
-        ]},
-        {'title': 'Display', 'name': 'display_settings', 'type': 'group', 'children': [
-            {'title': 'Live Feed', 'name': 'live_feed', 'type': 'group', 'children': [
-                {'title': 'Refresh Rate (s)', 'name': 'refresh_rate_s', 'type': 'float',
-                 'value': 1.0, 'limits': (0.1, 60.0),
-                 'tip': 'How often the histograms and images are redrawn (seconds)'},
-                {'title': 'Live Subsampling (%)', 'name': 'display_fraction', 'type': 'float',
-                 'value': 100.0, 'limits': (1.0, 100.0), 'step': 5.0, 'decimals': 0,
-                 'tip': ('Percentage of incoming events/pixels fed to the live display. '
-                         'Subsampling happens in the extractor workers before data is sent to the GUI, '
-                         'so reducing this also lowers display lag at high rates. '
-                         'Saving to disk is always full-resolution and unaffected.')},
-                {'title': 'Auto-clear (s, -1=off)', 'name': 'clear_interval', 'type': 'float',
-                 'value': -1.0, 'limits': (-1.0, 3600.0),
-                 'tip': 'Automatically clear histogram every N seconds during acquisition. -1 disables.'},
-                {'title': 'Time Window (s, -1=all)', 'name': 'max_time_window_s', 'type': 'float',
-                 'value': -1.0, 'limits': (-1.0, 3600.0),
-                 'tip': 'How many seconds of history the timeseries plots show. -1 = show all.'},
-            ]},
-            {'title': 'Appearance', 'name': 'appearance', 'type': 'group', 'children': [
-                {'title': 'Colormap', 'name': 'colormap', 'type': 'list',
-                 'limits': ['viridis', 'plasma', 'inferno', 'magma', 'thermal'],
-                 'value': 'viridis', 'tip': 'Colour scale for the 2D pixel images'},
-            ]},
-            {'title': 'Covariance Map', 'name': 'covariance', 'type': 'group', 'children': [
-                {'title': 'Enable', 'name': 'cov_enabled', 'type': 'bool', 'value': False,
-                 'tip': ('Accumulate per-shot covariance map. '
-                         'Requires trigger-correlated events (not pixel mode). '
-                         'C(m1,m2) = <n(m1)·n(m2)> - <n(m1)>·<n(m2)>')},
-                {'title': 'Bins', 'name': 'cov_bins', 'type': 'int', 'value': 200,
-                 'limits': (50, 2000),
-                 'tip': 'Number of TOF bins along each axis of the covariance map'},
-            ]},
-        ]},
-    ]
+    params = ACQUISITION_PARAMS
 
     def __init__(self):
         QMainWindow.__init__(self)
@@ -364,8 +174,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
             else:
                 self._cov_dock.hide()
                 self.get_action('show_covariance').setChecked(False)
-        elif name == 'cov_bins':
-            self.histogram.set_covariance_config(bins=param.value())
         elif name == 'refresh_rate_s':
             if self.is_acquiring:
                 self.refresh_timer.start(int(param.value() * 1000))
@@ -381,14 +189,16 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 self.pipeline_thread.set_display_fraction(frac)
         elif name == 'max_time_window_s':
             self._apply_timeseries_window(param.value())
+        elif name in ('enabled', 'coeff', 't0', 'mass_min', 'mass_max', 'mass_bins'):
+            self._on_mass_calib_changed()
 
     # =========================================================================
     # Display parameter — convenience property
     # =========================================================================
     @property
     def display(self):
-        """Shortcut to TofHistogramDock's display Parameter group."""
-        return self.tof_dock.display
+        """Shortcut to the mass calibration Parameter group in settings."""
+        return self.settings.child('display_settings', 'mass_calib')
 
     # =========================================================================
     # Status bar LEDs
@@ -578,7 +388,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.roi_manager = ROIManager(
             tof_plot=self.tof_dock.tof_plot,
             roi_table=self.tof_dock.roi_table,
-            display=self.tof_dock.display,
             main_window=self,
             dock_area=self.dock_area,
             total_dock=self.total_dock,
@@ -663,7 +472,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self._cov_dock.clear_requested.connect(self._on_clear_all)
         self.roi_manager.clear_requested.connect(self._on_clear_all)
         self.roi_manager.dock_created.connect(self._on_roi_dock_created)
-        self.tof_dock.display.sigTreeStateChanged.connect(self._on_display_param_changed)
+        self.tof_dock.tof_bin_spec_changed.connect(self._on_tof_bin_spec_changed)
+        self._cov_dock.cov_bin_spec_changed.connect(self._on_cov_bin_spec_changed)
 
         # ROI dock mini-toolbar → ROIManager
         self.tof_dock.add_roi_clicked.connect(self.roi_manager.add_roi)
@@ -713,14 +523,6 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
     # =========================================================================
     # Display parameter changes
     # =========================================================================
-    def _on_display_param_changed(self, _root, changes):
-        for param, _change, _data in changes:
-            name = param.name()
-            if name in ('tof_bins', 'tof_min_ns', 'tof_max_ns'):
-                self._on_tof_config_changed()
-            elif param.parent() is not None and param.parent().name() == 'mass_calib':
-                self._on_mass_calib_changed()
-
     def _on_clear_all(self):
         self.histogram.clear()
         self.histogram.clear_timeseries()
@@ -743,15 +545,24 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self.total_dock.set_colormap(name)
         self.roi_manager.set_colormap(name)
 
-    def _on_tof_config_changed(self):
-        tof_bins = self.display.child('tof_bins').value()
-        tof_min  = self.display.child('tof_min_ns').value()
-        tof_max  = self.display.child('tof_max_ns').value()
-        self.histogram.set_tof_config(tof_range=(tof_min, tof_max), tof_bins=tof_bins)
+    def _on_tof_bin_spec_changed(self):
+        spec = self.tof_dock.tof_bin_spec()
+        if spec is None:
+            return
+        self.histogram.set_tof_config(tof_range=(spec.start, spec.end), tof_bins=spec.n_bins)
+        self._cov_dock.set_tof_range(spec.start, spec.end)
+        self._update_histograms()
+
+    def _on_cov_bin_spec_changed(self):
+        spec = self._cov_dock.cov_bin_spec()
+        if spec is None:
+            return
+        self.histogram.set_covariance_config(bins=spec.n_bins, cov_range=(spec.start, spec.end))
+        self._cov_dock.clear()
         self._update_histograms()
 
     def _on_mass_calib_changed(self):
-        calib = self.display.child('mass_calib')
+        calib = self.display
         coeff   = calib.child('coeff').value()
         t0      = calib.child('t0').value()
         enabled = calib.child('enabled').value()
@@ -857,326 +668,8 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         self._status_dock.reset()
 
     # =========================================================================
-    # Config dict builders
+    # Acquisition Control  →  see pipeline_mixin.py
     # =========================================================================
-    def _build_connection_config(self):
-        s   = self.settings.child('serval', 'serval_destination')
-        adv = self.settings.child('pipeline', 'processing', 'advanced')
-        return {
-            'host': s['dest_host'],
-            'port': s['dest_port'],
-            'triggers_per_chunk': adv['triggers_per_chunk'],
-            'chunk_size': adv['chunk_size'],
-            'flush_timeout': adv['flush_timeout'],
-            'recv_buffer_size': adv['recv_buffer_mb'] * 1024 * 1024,
-        }
-
-    def _build_extract_config(self):
-        p   = self.settings.child('pipeline', 'processing')
-        cor = self.settings.child('pipeline', 'correlation')
-        c   = p.child('centroiding')
-        adv = p.child('advanced')
-        return {
-            'num_workers':      p['num_workers'],
-            'use_fast_extract': p['use_fast_extract'],
-            'tdc_id':           TDCChannel.from_label(cor['tdc_id']),
-            'edge':             TriggerEdge.from_label(cor['edge']),
-            'event_window':     (cor['event_window_min'], cor['event_window_max']),
-            'use_centroiding':  c['use_centroiding'],
-            'eps_space':        c['eps_space'],
-            'eps_time_ns':      c['eps_time_ns'],
-            'zmq_port':         adv['zmq_port'],
-            'zmq_hwm':          adv['zmq_hwm'],
-            # Column correction — populated by _start_acquisition from SERVAL chip config
-            'adjusted_columns': getattr(self, '_chip_adjust_columns', []),
-            'chip_config':      getattr(self, '_chip_config', {}),
-            # Full /detector tree, archived verbatim into run metadata
-            'detector_info':    getattr(self, '_detector_info', {}),
-        }
-
-    def _build_save_config(self):
-        p   = self.settings.child('pipeline', 'saving')
-        adv = p.child('advanced')
-        return {
-            'output_dir': p['output_dir'],
-            'raw':      {'enabled': p['save_raw'],     'num_savers': adv['raw_num_savers']},
-            'events':   {'enabled': p['save_events'],  'num_savers': adv['events_num_savers']},
-            'pixels':   {'enabled': p['save_pixels'],  'num_savers': adv['pixels_num_savers']},
-            'triggers': {'enabled': p['save_triggers'], 'num_savers': adv['triggers_num_savers']},
-        }
-
-    def _build_command_config(self):
-        s = self.settings.child('pipeline', 'external_control', 'command_server')
-        return {'enabled': s['cmd_enabled'], 'port': s['cmd_port']}
-
-    # =========================================================================
-    # Acquisition Control
-    # =========================================================================
-    def _on_run_clicked(self, checked: bool):
-        if checked:
-            self._start_acquisition()
-        else:
-            self._on_stop_clicked()
-
-    def _start_acquisition(self):
-        if self.is_acquiring:
-            return
-        if not self.serval.is_connected:
-            QMessageBox.warning(self, "Not Connected",
-                                "Please connect to SERVAL first.")
-            self.get_action('run').setChecked(False)
-            return
-
-        self.histogram.clear()
-        self.histogram.clear_timeseries()
-
-        # Fetch chip configuration for column timing correction.
-        # Done here (before workers start) so adjusted_columns is available at
-        # ExtractorWorker construction time.  A failure is non-fatal: we proceed
-        # with no correction and log a warning.
-        self._chip_config = {}
-        self._chip_adjust_columns = []
-        try:
-            chip_cfg = self.serval.get_chip_config(chip_id=0)
-            if chip_cfg:
-                self._chip_config = chip_cfg
-                self._chip_adjust_columns = self.serval.get_adjusted_columns(chip_id=0)
-                if self._chip_adjust_columns:
-                    self._log(
-                        f"Column correction: {len(self._chip_adjust_columns)} adjusted "
-                        f"double-column(s): {self._chip_adjust_columns}"
-                    )
-                else:
-                    self._log("Column correction: no adjusted double-columns reported by SERVAL")
-        except Exception as e:
-            self._log(f"Could not fetch chip config (column correction disabled): {e}", level=30)
-
-        # Fetch the full /detector info tree, archived verbatim into run metadata.
-        self._detector_info = {}
-        try:
-            self._detector_info = self.serval.get_detector_info()
-        except Exception as e:
-            self._log(f"Could not fetch detector info (metadata will omit it): {e}", level=30)
-
-        callback_mode = self.settings.child('pipeline', 'live', 'callback_mode').value()
-        display_fraction = self.settings.child('display_settings', 'live_feed', 'display_fraction').value() / 100.0
-        self.histogram.set_display_fraction(display_fraction)
-
-        self.pipeline_thread = PipelineThread(
-            connection_config=self._build_connection_config(),
-            save_config=self._build_save_config(),
-            extract_config=self._build_extract_config(),
-            callback_config={
-                'mode': callback_mode if callback_mode != 'disabled' else None,
-                'display_fraction': display_fraction,
-            },
-            command_config=self._build_command_config(),
-        )
-        self.pipeline_thread.event_data_ready.connect(self._on_event_data)
-        self.pipeline_thread.pixel_data_ready.connect(self._on_pixel_data)
-        self.pipeline_thread.pipeline_started.connect(self._on_pipeline_started)
-        self.pipeline_thread.pipeline_stopped.connect(self._on_pipeline_stopped)
-        self.pipeline_thread.error_occurred.connect(self._on_pipeline_error)
-        self.pipeline_thread.status_changed.connect(self._on_status_update)
-
-        self.pipeline_thread.start()
-        self._log("Starting pipeline...")
-        self._set_pipeline_controls_enabled(False)
-
-    def _on_pipeline_started(self):
-        self._log("TCP socket bound — configuring SERVAL...")
-        try:
-            p = self.settings.child('pipeline', 'saving')
-            log_path = Path(p['output_dir']) / 'serval.log'
-            enable_file_logging(log_path)
-            self._log(f"Logging to file: {log_path}")
-        except Exception as e:
-            self._log(f"Could not start file logging: {e}", level=30)
-        threading.Thread(target=self._configure_and_start_serval, daemon=True).start()
-
-    def _configure_and_start_serval(self):
-        """HTTP configuration — runs in a background thread."""
-        s = self.settings.child('serval', 'serval_destination')
-        host = s['dest_host']
-        port = s['dest_port']
-
-        self._log(f"Setting SERVAL destination → {host}:{port}")
-        if not self.serval.set_destination(host, port):
-            self._serval_sig.failed.emit("Failed to set SERVAL destination")
-            self.pipeline_thread.request_stop()
-            return
-
-        self._log("Starting SERVAL measurement...")
-        if not self.serval.start_measurement():
-            self._serval_sig.failed.emit("Failed to start SERVAL measurement")
-            self.pipeline_thread.request_stop()
-            return
-
-        self._serval_sig.started.emit()
-
-    def _on_serval_started(self):
-        """Called on the main thread after SERVAL HTTP configuration succeeds."""
-        self.is_acquiring = True
-        self.record_btn.setEnabled(self.serval.is_connected)
-        self._set_led(self.led_acquiring, True)
-        self._last_clear_time = time.time()
-        refresh_rate_s = self.settings.child('display_settings', 'live_feed', 'refresh_rate_s').value()
-        if refresh_rate_s > 0:
-            self.refresh_timer.start(int(refresh_rate_s * 1000))
-        callback_mode = self.settings.child('pipeline', 'live', 'callback_mode').value()
-        if callback_mode == 'disabled':
-            callback_mode = 'events'
-        self._display_mode = callback_mode
-        self._apply_display_mode(callback_mode)
-        self._log("Acquisition running")
-
-    def _validate_output_dir(self, path: Path) -> bool:
-        if not path.exists():
-            reply = QMessageBox.question(
-                self, "Output Directory",
-                f"Directory does not exist:\n{path}\n\nCreate it?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-            )
-            if reply == QMessageBox.No:
-                return False
-            try:
-                path.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                QMessageBox.critical(self, "Error", f"Could not create directory:\n{e}")
-                return False
-        if not os.access(path, os.W_OK):
-            QMessageBox.critical(self, "Error",
-                                 f"Output directory is not writable:\n{path}")
-            return False
-        return True
-
-    def _set_record_btn_state(self, recording: bool):
-        if recording:
-            self.record_btn.setText("Stop")
-            self.record_btn.setStyleSheet(
-                "QPushButton { font-weight: bold; padding: 6px; }"
-                "QPushButton:enabled { background-color: #f44336; color: white; }")
-        else:
-            self.record_btn.setText("Save")
-            self.record_btn.setStyleSheet(
-                "QPushButton { font-weight: bold; padding: 6px; }"
-                "QPushButton:enabled { background-color: #2196F3; color: white; }")
-
-    def _on_save_clicked(self):
-        if not self.is_acquiring or self.pipeline_thread is None:
-            return
-        if self._is_recording:
-            self._save_timer.stop()
-            self._stop_save()
-        else:
-            p = self.settings.child('pipeline', 'saving')
-            output_dir = Path(p['output_dir'])
-            if not self._validate_output_dir(output_dir):
-                return
-            filename = self.record_filename_edit.text().strip()
-            if not filename:
-                filename = datetime.now().strftime("rec_%Y%m%d_%H%M%S")
-            ok = self.pipeline_thread.start_record(
-                filename=filename,
-                save_raw=p['save_raw'],
-                save_events=p['save_events'],
-                save_pixels=p['save_pixels'],
-                save_triggers=p['save_triggers'],
-            )
-            if ok:
-                self._last_record_filename = filename
-                self._is_recording = True
-                self._record_start_time = time.monotonic()
-                self._set_record_btn_state(True)
-                self._set_led(self.led_recording, True, color='#ff4444')
-                self.record_filename_edit.setEnabled(False)
-                self.save_duration_spin.setEnabled(False)
-                self._log(f"Recording started: {filename}")
-                duration = self.save_duration_spin.value()
-                if duration > 0:
-                    self._save_timer.start(int(duration * 1000))
-
-    def _auto_stop_save(self):
-        if self._is_recording:
-            self._stop_save()
-
-    def _stop_save(self):
-        if self.pipeline_thread is not None:
-            self.pipeline_thread.stop_record()
-        self._is_recording = False
-        self._record_start_time = None
-        self.record_time_label.setText("")
-        self._set_record_btn_state(False)
-        self._set_led(self.led_recording, False)
-        self._prefill_next_record_filename()
-        self.record_filename_edit.setEnabled(True)
-        self.save_duration_spin.setEnabled(True)
-        self._log("Recording stopped")
-
-    def _prefill_next_record_filename(self):
-        """After a recording finishes, either clear the name field or, if
-        auto-increment is enabled, prefill it with the previous name's
-        trailing number bumped by one."""
-        if self.auto_increment_check.isChecked() and self._last_record_filename:
-            self.record_filename_edit.setText(
-                _increment_filename(self._last_record_filename))
-        else:
-            self.record_filename_edit.clear()
-
-    def _on_stop_clicked(self):
-        if not self.is_acquiring:
-            return
-        if self._is_recording:
-            self._save_timer.stop()
-            self.pipeline_thread.stop_record()
-            self._is_recording = False
-            self._record_start_time = None
-            self.record_time_label.setText("")
-        self._log("Stopping acquisition...")
-        self.serval.stop_measurement()
-        if self.pipeline_thread:
-            self.pipeline_thread.request_stop()
-
-    def _on_pipeline_stopped(self):
-        disable_file_logging()
-        self._reset_pipeline_status()
-        self.is_acquiring = False
-        self._is_recording = False
-        self._record_start_time = None
-        self.record_time_label.setText("")
-        self._save_timer.stop()
-        self.record_btn.setEnabled(False)
-        self._set_record_btn_state(False)
-        self._set_led(self.led_acquiring, False)
-        self._set_led(self.led_recording, False)
-        self._prefill_next_record_filename()
-        self.record_filename_edit.setEnabled(True)
-        self.save_duration_spin.setEnabled(True)
-        self._set_pipeline_controls_enabled(True)
-        self.refresh_timer.stop()
-        self._last_clear_time = None
-        self._lag_ms = None
-        self._log("Acquisition stopped")
-        self._update_histograms()
-
-    def _on_pipeline_error(self, msg: str):
-        self._log(f"Pipeline error: {msg}", level=40)
-        QMessageBox.critical(self, "Pipeline Error", msg)
-
-    @staticmethod
-    def _set_group_enabled(param, enabled: bool):
-        for child in param.children():
-            if child.hasChildren():
-                ServalAcquisitionGUI._set_group_enabled(child, enabled)
-            else:
-                child.setOpts(enabled=enabled)
-
-    def _set_pipeline_controls_enabled(self, enabled: bool):
-        self._set_group_enabled(self.settings.child('pipeline'), enabled)
-        self._set_group_enabled(
-            self.settings.child('serval', 'serval_destination'), enabled)
-        self.get_action('run').setChecked(not enabled)
-
     # =========================================================================
     # Data Handlers
     # =========================================================================
@@ -1224,7 +717,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         for name in spatial_names:
             centers, counts = self.histogram.get_spatial_roi_tof("", name)
             if mass_mode:
-                calib = self.display.child('mass_calib')
+                calib = self.display
                 coeff = calib.child('coeff').value() or 1.0
                 t0    = calib.child('t0').value()
                 centers = np.clip((centers - t0) / coeff, 0.0, None) ** 2
@@ -1232,7 +725,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         if spatial_names:
             centers, counts = self.histogram.get_combined_tof("")
             if mass_mode:
-                calib = self.display.child('mass_calib')
+                calib = self.display
                 coeff = calib.child('coeff').value() or 1.0
                 t0    = calib.child('t0').value()
                 centers = np.clip((centers - t0) / coeff, 0.0, None) ** 2
@@ -1254,7 +747,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
         if self.settings.child('display_settings', 'covariance', 'cov_enabled').value():
             centers_ns, cov, corr, n_shots = self.histogram.get_covariance_map()
             if self.histogram.is_mass_calibration_enabled():
-                calib = self.display.child('mass_calib')
+                calib = self.display
                 coeff = calib.child('coeff').value() or 1.0
                 t0    = calib.child('t0').value()
                 centers = np.clip((centers_ns - t0) / coeff, 0, None) ** 2
@@ -1284,76 +777,7 @@ class ServalAcquisitionGUI(QMainWindow, ParameterManager, ActionManager):
                 f"cov {(t_cov - t_tof) * 1000:.1f}, "
                 f"status {(t_status - t_cov) * 1000:.1f})")
 
-    # =========================================================================
-    # Session persistence
-    # =========================================================================
-    # Parameter types whose value is a persistable scalar config setting
-    # (as opposed to 'group'/'action_led' container nodes or transient
-    # action/status indicators).
-    _CONFIG_LEAF_TYPES = ('str', 'int', 'float', 'bool', 'list')
-
-    def _iter_config_params(self, parent=None):
-        """Recursively yield every leaf Parameter under *parent* (default
-        ``self.settings``) representing a user-configurable setting."""
-        if parent is None:
-            parent = self.settings
-        for child in parent.children():
-            if child.hasChildren():
-                yield from self._iter_config_params(child)
-            elif child.type() in self._CONFIG_LEAF_TYPES:
-                yield child
-
-    def _qsettings(self) -> QSettings:
-        return QSettings('SERVAL', 'AcquisitionGUI')
-
-    def _restore_session(self):
-        s = self._qsettings()
-        if geom := s.value('geometry'):
-            self.restoreGeometry(geom)
-        if state := s.value('dockarea_state'):
-            try:
-                self.dock_area.restoreState(state)
-                # Sanity-check: if all main docks ended up hidden, the saved
-                # state is stale — drop it and let the default layout stand.
-                core_docks = [self._settings_dock, self.tof_dock, self.total_dock]
-                if all(not d.isVisible() for d in core_docks):
-                    self.dock_area.restoreState(None)
-                    s.remove('dockarea_state')
-            except Exception:
-                s.remove('dockarea_state')  # Discard incompatible saved state
-        for child in self.display.children():
-            key = f'tof/{child.name()}'
-            if (val := s.value(key)) is not None:
-                try:
-                    child.setValue(type(child.value())(val))
-                except Exception:
-                    pass
-        # Acquisition / pipeline configuration (SERVAL connection, saving
-        # options, processing parameters, ...)
-        for child in self._iter_config_params():
-            key = 'config/' + '/'.join(self.settings.childPath(child))
-            if s.contains(key):
-                try:
-                    child.setValue(s.value(key, child.value(), type(child.value())))
-                except Exception:
-                    pass
-        # Toolbar style — applied after all docks are built so every toolbar is covered
-        if (saved := s.value('toolbar_style')) is not None:
-            restored = Qt.ToolButtonStyle(int(saved))
-            self._apply_toolbar_style(restored)
-            for act, (_lbl, style) in zip(
-                    self._toolbar_style_group.actions(), self._TOOLBAR_STYLES):
-                act.setChecked(style == restored)
-
-    def _save_session(self):
-        s = self._qsettings()
-        s.setValue('geometry', self.saveGeometry())
-        s.setValue('dockarea_state', self.dock_area.saveState())
-        for child in self.display.children():
-            s.setValue(f'tof/{child.name()}', child.value())
-        for child in self._iter_config_params():
-            key = 'config/' + '/'.join(self.settings.childPath(child))
-            s.setValue(key, child.value())
+    # Session persistence  →  see session_mixin.py
 
     # =========================================================================
     # Window Events

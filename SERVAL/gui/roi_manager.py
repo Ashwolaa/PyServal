@@ -31,8 +31,6 @@ class ROIManager(BaseROIManager):
         The TOF histogram plot where LinearRegionItems are added.
     roi_table : QTableWidget
         The 6-column table widget (owned by TofHistogramDock).
-    display : Parameter
-        The display Parameter group (used to read tof_min/max_ns for new ROIs).
     main_window : QMainWindow
         Used as the parent for dock-related dialogs.
     dock_area : DockArea
@@ -53,12 +51,11 @@ class ROIManager(BaseROIManager):
     spatial_roi_changed = Signal(str, str, str, str, int, int, int, int) # parent,name,shape,op,x,y,w,h
     spatial_rois_cleared = Signal(str)                                   # parent
 
-    def __init__(self, tof_plot, roi_table: QTableWidget, display, main_window,
+    def __init__(self, tof_plot, roi_table: QTableWidget, main_window,
                  dock_area, total_dock, parent=None):
         super().__init__(parent)
         self._tof_plot = tof_plot
         self._roi_table = roi_table
-        self._display = display
         self._main_window = main_window
         self._dockarea = dock_area
         self._total_dock = total_dock
@@ -169,8 +166,8 @@ class ROIManager(BaseROIManager):
         color = ROI_COLORS[self._roi_counter % len(ROI_COLORS)]
         self._roi_counter += 1
 
-        tof_ns_lo = self._display.child('tof_min_ns').value()
-        tof_ns_hi = self._display.child('tof_max_ns').value()
+        x_range = self._tof_plot.viewRange()[0]
+        tof_ns_lo, tof_ns_hi = x_range[0], x_range[1]
         span_ns = tof_ns_hi - tof_ns_lo
         tof_min_ns = tof_ns_lo + span_ns * 0.2
         tof_max_ns = tof_ns_lo + span_ns * 0.4
